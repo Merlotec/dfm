@@ -1,0 +1,52 @@
+{
+  "_comment": "HFM-1D latent-rollout fluid model hyperparameters.",
+
+  "model": {
+    "img_size": 256,
+    "in_channels": 4,
+    "patch_px": 16,
+
+    "d_model": 256,
+    "n_slots": 64,
+    "n_heads": 8,
+
+    "n_enc_layers": 4,
+
+    "n_evo_layers": 2,
+    "integrator": "rk2",
+    "max_rollout": 64,
+    "reencode_every": 2,
+
+    "skip_ch": 32,
+
+    "horizon": 4,
+    "horizon_gamma": 1.0,
+
+    "noise_std": 0.05,
+
+    "mlp_ratio": 4.0,
+    "dropout": 0.0,
+
+    "n_context_frames": 5,
+    "ctx_patch_px": 16,
+    "d_ctx": 256,
+    "n_ctx_tokens": 64,
+    "n_ctx_layers": 4,
+    "n_ctx_heads": 8,
+
+    "disc_dim": 128,
+    "disc_adv_weight": 0.02,
+    "disc_lr": 1e-4
+  },
+
+  "training": {
+    "batch_size": 4,
+    "n_epochs": 100,
+
+    "lr": 1e-4,
+    "weight_decay": 1e-5,
+    "clip_grad": 1.0,
+
+    "l1_weight": 0.1
+  }
+}
