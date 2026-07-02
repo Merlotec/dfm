@@ -13,7 +13,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hfm1d import HFM1DConfig, RolloutGANTrainer
+from dfm import HFM1DConfig, RolloutGANTrainer
 
 
 def main():

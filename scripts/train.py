@@ -23,8 +23,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hfm1d import HFM1DConfig, RolloutGANTrainer
-from hfm1d.data import FVMDataModule, build_renderer, load_pixel_mask
+from dfm import HFM1DConfig, RolloutGANTrainer
+from dfm.data import FVMDataModule, build_renderer, load_pixel_mask
 
 _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'

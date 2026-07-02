@@ -31,6 +31,23 @@ for _p in (_SOLVER_DIR, _GEN_DIR):
 
 from renderer import MeshRenderer  # noqa: E402  (needs path injection above)
 
+# Back-compat: shared_mesh.pkl predates the solver reorganisation that moved
+# FVMMesh from `time_fvm.fvm_mesh` to `time_fvm.mesh_utils.fvm_mesh`.  Alias the
+# old module path so the pickle resolves.
+try:
+    import time_fvm.mesh_utils.fvm_mesh as _fvm_mesh_mod  # noqa: E402
+    sys.modules.setdefault('time_fvm.fvm_mesh', _fvm_mesh_mod)
+except Exception:
+    pass
+
+
+def _mesh_triangles(fvm_mesh):
+    """Cell→vertex connectivity, renamed `cells` → `triangles` post-reorg."""
+    tris = getattr(fvm_mesh, 'triangles', None)
+    if tris is None:
+        tris = fvm_mesh.cells
+    return tris
+
 
 # ---------------------------------------------------------------------------
 # Renderer factory
@@ -48,8 +65,9 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
     with open(mesh_pkl, 'rb') as f:
         mesh_dict = pickle.load(f)
     fvm_mesh = mesh_dict['mesh']
+    tris  = _mesh_triangles(fvm_mesh)
     verts = fvm_mesh.vertices.cpu().numpy()
-    n_cells = int(fvm_mesh.cells.shape[0])
+    n_cells = int(tris.shape[0])
     x0, x1 = float(verts[:, 0].min()), float(verts[:, 0].max())
     y0, y1 = float(verts[:, 1].min()), float(verts[:, 1].max())
 
@@ -68,7 +86,7 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
 
     renderer = MeshRenderer(
         verts,
-        fvm_mesh.cells.cpu().numpy(),
+        tris.cpu().numpy(),
         resolution=resolution,
         device=device,
     )
@@ -262,8 +280,13 @@ class FVMDataModule:
     def setup(self, recompute_stats: bool = False):
         renderer = build_renderer(self.data_dir, self.resolution)
 
-        sim_dirs = sorted([p for p in self.data_dir.iterdir()
-                           if p.is_dir() and p.name.startswith('run')])
+        # A simulation directory is any subdirectory containing frame files
+        # (t_*.npz).  This is robust to run-naming conventions (run*, mu_b_*, …).
+        sim_dirs = sorted(
+            p for p in self.data_dir.iterdir()
+            if p.is_dir() and not p.name.startswith('.')
+            and any(f.name.startswith('t_') and f.name.endswith('.npz') for f in p.iterdir())
+        )
         if not sim_dirs:
             raise RuntimeError(f'No simulation subdirectories found in {self.data_dir}')
 

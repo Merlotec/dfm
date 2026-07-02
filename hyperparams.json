@@ -12,7 +12,7 @@
 
     "n_enc_layers": 4,
 
-    "n_evo_layers": 2,
+    "n_evo_layers": 4,
     "integrator": "rk2",
     "max_rollout": 64,
     "reencode_every": 2,
