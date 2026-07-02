@@ -70,6 +70,7 @@ def load_config() -> tuple[HFM1DConfig, dict]:
         disc_dim         = m['disc_dim'],
         disc_adv_weight  = m['disc_adv_weight'],
         disc_lr          = m['disc_lr'],
+        gradient_checkpointing = m.get('gradient_checkpointing', False),
     )
     return cfg, t
 
@@ -89,6 +90,8 @@ def main():
     parser.add_argument('--resume',    type=str, default=None, nargs='?', const='latest')
     parser.add_argument('--epochs',    type=int, default=None)
     parser.add_argument('--log-every', type=int, default=50)
+    parser.add_argument('--no-compile', action='store_true',
+                        help='Disable torch.compile even if enabled in hyperparams.json')
     args = parser.parse_args()
 
     device = get_device()
@@ -99,11 +102,15 @@ def main():
     # history frames + seed frame + horizon target frames
     seq_len  = cfg.n_context_frames + 1 + cfg.horizon
 
+    num_workers  = train_hp.get('num_workers', 4)
+    cache_frames = train_hp.get('cache_frames', False)
+
     dm = FVMDataModule(
-        data_dir    = args.data,
-        seq_len     = seq_len,
-        batch_size  = train_hp['batch_size'],
-        num_workers = 4,
+        data_dir     = args.data,
+        seq_len      = seq_len,
+        batch_size   = train_hp['batch_size'],
+        num_workers  = num_workers,
+        cache_frames = cache_frames,
     )
     dm.setup()
 
@@ -113,12 +120,13 @@ def main():
     val_dl = val_pixel_mask = None
     if args.test_data.exists():
         val_dm = FVMDataModule(
-            data_dir    = args.test_data,
-            seq_len     = seq_len,
-            batch_size  = train_hp['batch_size'],
-            num_workers = 4,
-            mean        = dm.mean,
-            std         = dm.std,
+            data_dir     = args.test_data,
+            seq_len      = seq_len,
+            batch_size   = train_hp['batch_size'],
+            num_workers  = num_workers,
+            cache_frames = cache_frames,
+            mean         = dm.mean,
+            std          = dm.std,
         )
         val_dm.setup()
         val_renderer   = build_renderer(args.test_data, (cfg.img_size, cfg.img_size))
@@ -139,6 +147,11 @@ def main():
         pixel_mask            = pixel_mask,
     )
     trainer.to(device)
+
+    # --- CUDA throughput: TF32 matmuls on the tensor cores ---
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cudnn.benchmark = True
 
     if args.resume == 'latest':
         candidates = sorted(CKPT_DIR.glob('train_*.pt'))
@@ -161,6 +174,15 @@ def main():
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:         {len(dm._dataset)} sequences  (seq_len={seq_len}, horizon={cfg.horizon})')
     print(f'Curriculum:      GAN activates at step {GAN_START_STEP}\n')
+
+    # --- torch.compile last: after load/param-count. Optimizer keeps the same
+    #     Parameter objects, and trainer.save/load unwrap _orig_mod so
+    #     checkpoints stay compatible with uncompiled inference. ---
+    if device.type == 'cuda' and train_hp.get('compile', False) and not args.no_compile:
+        print('Compiling model (first optimised step will be slow)...')
+        trainer.model           = torch.compile(trainer.model)
+        trainer.context_encoder = torch.compile(trainer.context_encoder)
+        trainer.discriminator   = torch.compile(trainer.discriminator)
 
     CKPT_DIR.mkdir(exist_ok=True)
     loss_log_path = CKPT_DIR / 'loss_log.csv'

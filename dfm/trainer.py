@@ -311,10 +311,14 @@ class RolloutGANTrainer:
         return preds
 
     def save(self, path: str):
+        # Unwrap torch.compile so checkpoints store plain (uncompiled) keys,
+        # keeping them loadable by uncompiled inference.
+        def _u(m):
+            return getattr(m, '_orig_mod', m)
         torch.save({
-            'model':           self.model.state_dict(),
-            'context_encoder': self.context_encoder.state_dict(),
-            'discriminator':   self.discriminator.state_dict(),
+            'model':           _u(self.model).state_dict(),
+            'context_encoder': _u(self.context_encoder).state_dict(),
+            'discriminator':   _u(self.discriminator).state_dict(),
             'gen_optimizer':   self.gen_optimizer.state_dict(),
             'disc_optimizer':  self.disc_optimizer.state_dict(),
             'scheduler':       self.scheduler.state_dict(),
@@ -323,12 +327,14 @@ class RolloutGANTrainer:
         }, path)
 
     def load(self, path: str):
+        def _u(m):
+            return getattr(m, '_orig_mod', m)
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        self.model.load_state_dict(ckpt['model'], strict=False)
+        _u(self.model).load_state_dict(ckpt['model'], strict=False)
         if 'context_encoder' in ckpt:
-            self.context_encoder.load_state_dict(ckpt['context_encoder'], strict=False)
+            _u(self.context_encoder).load_state_dict(ckpt['context_encoder'], strict=False)
         if 'discriminator' in ckpt:
-            self.discriminator.load_state_dict(ckpt['discriminator'], strict=False)
+            _u(self.discriminator).load_state_dict(ckpt['discriminator'], strict=False)
         self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
         if 'disc_optimizer' in ckpt:
             self.disc_optimizer.load_state_dict(ckpt['disc_optimizer'])
