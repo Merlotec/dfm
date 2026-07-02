@@ -99,18 +99,20 @@ def main():
 
     cfg, train_hp = load_config()
     n_epochs = args.epochs or train_hp['n_epochs']
-    # history frames + seed frame + horizon target frames
-    seq_len  = cfg.n_context_frames + 1 + cfg.horizon
 
     num_workers  = train_hp.get('num_workers', 4)
     cache_frames = train_hp.get('cache_frames', False)
 
+    # Context is sampled from a random in-run offset (decoupled from the seed);
+    # prediction windows are seed + horizon targets.
     dm = FVMDataModule(
         data_dir     = args.data,
-        seq_len      = seq_len,
+        n_context    = cfg.n_context_frames,
+        horizon      = cfg.horizon,
         batch_size   = train_hp['batch_size'],
         num_workers  = num_workers,
         cache_frames = cache_frames,
+        random_context = True,
     )
     dm.setup()
 
@@ -121,10 +123,12 @@ def main():
     if args.test_data.exists():
         val_dm = FVMDataModule(
             data_dir     = args.test_data,
-            seq_len      = seq_len,
+            n_context    = cfg.n_context_frames,
+            horizon      = cfg.horizon,
             batch_size   = train_hp['batch_size'],
             num_workers  = num_workers,
             cache_frames = cache_frames,
+            random_context = False,   # deterministic context for stable val loss
             mean         = dm.mean,
             std          = dm.std,
         )
@@ -172,7 +176,8 @@ def main():
     assert dm._dataset is not None
     steps_per_epoch = math.ceil(len(dm._dataset) / train_hp['batch_size'])
     start_epoch     = trainer.global_step // steps_per_epoch
-    print(f'Dataset:         {len(dm._dataset)} sequences  (seq_len={seq_len}, horizon={cfg.horizon})')
+    print(f'Dataset:         {len(dm._dataset)} sequences  '
+          f'(n_context={cfg.n_context_frames}, horizon={cfg.horizon}, random context offset)')
     print(f'Curriculum:      GAN activates at step {GAN_START_STEP}\n')
 
     # --- torch.compile last: after load/param-count. Optimizer keeps the same
@@ -196,9 +201,10 @@ def main():
     nan_streak = 0
     for epoch in range(start_epoch, n_epochs):
         recon_sum, recon_cnt = 0.0, 0
-        for batch in dm.train_dataloader():
-            frames = [batch[:, t].to(device) for t in range(batch.shape[1])]
-            recon, disc = trainer.step(frames, pixel_mask=pixel_mask)
+        for context_b, pred_b in dm.train_dataloader():
+            context_frames = [context_b[:, t].to(device) for t in range(context_b.shape[1])]
+            pred_frames    = [pred_b[:, t].to(device)    for t in range(pred_b.shape[1])]
+            recon, disc = trainer.step(context_frames, pred_frames, pixel_mask=pixel_mask)
             info = trainer.training_info()
             step = info['global_step']
 

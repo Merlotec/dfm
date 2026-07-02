@@ -278,38 +278,42 @@ def main():
         raise RuntimeError(f'No simulation subdirectories found in {data_dir}')
     print(f'  Found {len(sim_dirs)} simulation directories\n')
 
-    # context frames + seed + n_predict targets (seed is targets[-1]'s predecessor)
-    seq_len = n_context + args.n_predict + 1
+    # Prediction window = seed + n_predict targets; context is sampled separately.
+    pred_len = args.n_predict + 1
 
     for sim_idx, sim_dir in enumerate(sim_dirs):
         print(f'[{sim_idx+1}/{len(sim_dirs)}] {sim_dir.name}')
         run_out = out_dir / sim_dir.name
         run_out.mkdir(parents=True, exist_ok=True)
 
+        # random_context=False → context taken deterministically from the run
+        # start (reproducible eval), decoupled from the prediction window.
         ds = FVMSequenceDataset.with_cache(
-            sim_dir, renderer, seq_len, mean, std, first_frame=args.first_frame
+            sim_dir, renderer, n_context, pred_len, mean, std,
+            first_frame=args.first_frame, random_context=False,
         )
         if len(ds) == 0:
             print(f'  [skip] no sequences available')
             continue
 
         start = args.seq_start if args.seq_start is not None else len(ds) // 2
-        seq   = ds[start]
-        frames_gt  = [seq[t:t+1].to(device) * pixel_mask for t in range(seq_len)]
-        timestamps = [float(ds.paths[start + t].stem[2:]) for t in range(seq_len)]
+        ctx_seq, pred_seq = ds[start]
+        context_frames = [ctx_seq[t:t+1].to(device) * pixel_mask for t in range(n_context)]
+        pred_gt        = [pred_seq[t:t+1].to(device) * pixel_mask for t in range(pred_len)]
+        pred_ts        = [float(ds.paths[start + t].stem[2:]) for t in range(pred_len)]
 
-        x0 = frames_gt[n_context]
+        x0 = pred_gt[0]
 
         # ---- encode context once, then roll the latent forward ----
         with torch.no_grad():
-            context = context_encoder(frames_gt[:n_context], pixel_mask=pixel_mask)
+            context = context_encoder(context_frames, pixel_mask=pixel_mask)
             preds_list = model(x0, context, horizon=args.n_predict, pixel_mask=pixel_mask)
 
         preds, gt = [], []
         for t, pred in enumerate(preds_list):
             pred = pred.float() * pixel_mask
             preds.append(pred.cpu())
-            target = frames_gt[n_context + 1 + t]
+            target = pred_gt[1 + t]
             gt.append(target.cpu())
             mae = (target - pred).abs().mean().item()
             print(f'  t={t+1:3d}  MAE={mae:.5f}')
@@ -318,8 +322,8 @@ def main():
         saliency_fakes, saliency_reals = [], []
         if discriminator is not None:
             for t, pred in enumerate(preds_list):
-                x_prev = frames_gt[n_context + t]           # true previous frame
-                target = frames_gt[n_context + 1 + t]
+                x_prev = pred_gt[t]                 # true previous frame
+                target = pred_gt[1 + t]
                 pred_m = pred.float() * pixel_mask
                 saliency_fakes.append(disc_saliency(discriminator, pred_m, x_prev, context))
                 saliency_reals.append(disc_saliency(discriminator, target, x_prev, context))
@@ -335,16 +339,13 @@ def main():
         np.save(run_out / 'frames_gt_phys.npy',   gt_phys)
         np.save(run_out / 'frames_pred_phys.npy', pred_phys)
 
-        context_phys = denorm(
-            torch.cat([frames_gt[t].cpu() for t in range(n_context)], dim=0).numpy(),
-            mean, std,
-        ) * pixel_mask.cpu().numpy()
-        all_ts = timestamps[:n_context] + timestamps[n_context + 1: n_context + 1 + args.n_predict]
+        # Viewer timeline = seed (is_seed) followed by the predicted frames.
+        seed_phys = denorm(pred_gt[0].cpu().numpy(), mean, std) * pixel_mask.cpu().numpy()
         save_viewer_frames(
-            gt_phys    = context_phys,
+            gt_phys    = seed_phys,
             pred_phys  = pred_phys,
-            timestamps = all_ts,
-            n_context  = n_context,
+            timestamps = pred_ts,
+            n_context  = 1,
             run_name   = sim_dir.name,
             viewer_dir = out_dir / 'viewer',
         )

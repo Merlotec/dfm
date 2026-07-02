@@ -64,11 +64,11 @@ def train_step_gan(
     model: HFM1D,
     context_encoder: ContextEncoder,
     discriminator: HFMDiscriminator,
-    frames: List[torch.Tensor],
+    context_frames: List[torch.Tensor],
+    pred_frames: List[torch.Tensor],
     gen_optimizer: optim.Optimizer,
     disc_optimizer: optim.Optimizer,
     criterion: nn.Module,
-    n_context: int,
     horizon: int,
     horizon_gamma: float = 1.0,
     adv_weight: float = 0.0,
@@ -77,22 +77,24 @@ def train_step_gan(
     disc_update_threshold: float = 0.5,
 ) -> Tuple[float, float]:
     """
-    frames[0 .. n_context-1]            → ContextEncoder → context
-    frames[n_context]                   → x0 (rollout seed)
-    frames[n_context+1 .. +horizon]     → targets
+    context_frames  → ContextEncoder → context   (sampled from a random in-run
+                                                   offset, decoupled from the seed)
+    pred_frames[0]                    → x0 (rollout seed)
+    pred_frames[1 .. horizon]         → targets
 
     Returns (mean recon_loss, disc_loss).  disc_loss is 0.0 when adv_weight == 0.
     """
     gen_optimizer.zero_grad()
     disc_optimizer.zero_grad()
 
-    device_type = frames[0].device.type
+    device_type = pred_frames[0].device.type
     amp = device_type == 'cuda'
 
-    x0      = frames[n_context]
-    targets = frames[n_context + 1: n_context + 1 + horizon]
-    # ground-truth previous frame for each prediction (teacher conditioning)
-    prevs   = frames[n_context: n_context + horizon]
+    x0      = pred_frames[0]
+    targets = pred_frames[1: 1 + horizon]
+    # ground-truth previous frame for each prediction (teacher conditioning):
+    # pred[i] predicts pred_frames[i+1], whose true predecessor is pred_frames[i].
+    prevs   = pred_frames[0: horizon]
 
     # per-step discount weights, normalised to sum to 1
     weights = torch.tensor([horizon_gamma ** i for i in range(horizon)],
@@ -100,7 +102,7 @@ def train_step_gan(
     weights = weights / weights.sum()
 
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        context = context_encoder(frames[:n_context], pixel_mask=pixel_mask)
+        context = context_encoder(context_frames, pixel_mask=pixel_mask)
         preds   = model(x0, context, horizon=horizon, pixel_mask=pixel_mask)
 
     preds_masked = [
@@ -249,17 +251,21 @@ class RolloutGANTrainer:
         self.criterion       = self.criterion.to(device)
         return self
 
-    def step(self, frames: List[torch.Tensor],
+    def step(self, context_frames: List[torch.Tensor],
+             pred_frames: List[torch.Tensor],
              pixel_mask: Optional[torch.Tensor] = None) -> Tuple[float, float]:
-        """frames: list of (n_context + 1 + horizon) tensors [B, C, H, W]."""
+        """
+        context_frames : list of n_context tensors [B, C, H, W] (decoupled context)
+        pred_frames    : list of (1 + horizon) tensors [B, C, H, W] (seed + targets)
+        """
         self.model.train()
         self.context_encoder.train()
         self.discriminator.train()
 
         recon_loss, disc_loss = train_step_gan(
-            self.model, self.context_encoder, self.discriminator, frames,
+            self.model, self.context_encoder, self.discriminator,
+            context_frames, pred_frames,
             self.gen_optimizer, self.disc_optimizer, self.criterion,
-            n_context=self.cfg.n_context_frames,
             horizon=self.cfg.horizon,
             horizon_gamma=self.cfg.horizon_gamma,
             adv_weight=self._current_adv_weight(),
@@ -283,14 +289,14 @@ class RolloutGANTrainer:
     def validate(self, dataloader, pixel_mask: Optional[torch.Tensor] = None) -> float:
         self.model.eval()
         self.context_encoder.eval()
-        n_ctx = self.cfg.n_context_frames
         total, count = 0.0, 0
         device = next(self.model.parameters()).device
-        for batch in dataloader:
-            frames = [batch[:, t].to(device) for t in range(batch.shape[1])]
-            context = self.context_encoder(frames[:n_ctx], pixel_mask=pixel_mask)
-            preds = self.model(frames[n_ctx], context, pixel_mask=pixel_mask)
-            targets = frames[n_ctx + 1: n_ctx + 1 + self.cfg.horizon]
+        for context_b, pred_b in dataloader:
+            context_frames = [context_b[:, t].to(device) for t in range(context_b.shape[1])]
+            pred_frames    = [pred_b[:, t].to(device)    for t in range(pred_b.shape[1])]
+            context = self.context_encoder(context_frames, pixel_mask=pixel_mask)
+            preds   = self.model(pred_frames[0], context, pixel_mask=pixel_mask)
+            targets = pred_frames[1: 1 + self.cfg.horizon]
             loss = torch.zeros((), device=device)
             for i in range(len(preds)):
                 loss = loss + self.criterion(preds[i], targets[i])

@@ -173,39 +173,64 @@ def compute_normalisation_stats(
 
 class FVMSequenceDataset(Dataset):
     """
-    Sliding-window sequences of `seq_len` consecutive rendered frames from one
-    simulation run.
+    Prediction windows and decoupled context, both drawn from one simulation run.
 
-    Returns [seq_len, C, H, W] float32 tensors, normalised per channel.
+    Each item is a tuple ``(context, pred)``:
+      - ``pred``    : [pred_len, C, H, W]   consecutive frames = seed + targets,
+                      a sliding window over the run (the quantity being predicted).
+      - ``context`` : [n_context, C, H, W]  a contiguous block of frames sampled
+                      from a *random* offset in the SAME run, independent of the
+                      prediction window.
+
+    Decoupling context from the prediction window forces the ContextEncoder to
+    summarise the run's governing dynamics (viscosity, BCs, geometry) rather than
+    a snapshot of the state immediately preceding the seed.  Set
+    ``random_context=False`` (eval) to take the context deterministically from the
+    start of the run.
     """
 
     def __init__(
         self,
-        sim_dir:     Path,
-        renderer:    MeshRenderer,
-        seq_len:     int,
-        mean:        torch.Tensor,
-        std:         torch.Tensor,
-        first_frame: int = 20,
-        frame_cache: Optional[list[torch.Tensor]] = None,
+        sim_dir:        Path,
+        renderer:       MeshRenderer,
+        n_context:      int,
+        pred_len:       int,
+        mean:           torch.Tensor,
+        std:            torch.Tensor,
+        first_frame:    int = 20,
+        frame_cache:    Optional[list[torch.Tensor]] = None,
+        random_context: bool = True,
     ):
         files = sorted(
             [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
             key=lambda f: float(f.stem[2:]),
         )[first_frame:]
-        self.paths      = files
-        self.renderer   = renderer
-        self.seq_len    = seq_len
-        self.mean       = mean.view(-1, 1, 1)   # [C, 1, 1] for broadcasting
-        self.std        = std.view(-1, 1, 1)
-        self._cache     = frame_cache            # optional pre-rendered cache
+        self.paths          = files
+        self.renderer       = renderer
+        self.n_context      = n_context
+        self.pred_len       = pred_len
+        self.random_context = random_context
+        self.mean           = mean.view(-1, 1, 1)   # [C, 1, 1] for broadcasting
+        self.std            = std.view(-1, 1, 1)
+        self._cache         = frame_cache            # optional pre-rendered cache
 
     def __len__(self) -> int:
-        return max(0, len(self.paths) - self.seq_len + 1)
+        # Need enough frames for both a prediction window and a context block.
+        if len(self.paths) < self.n_context:
+            return 0
+        return max(0, len(self.paths) - self.pred_len + 1)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        frames = torch.stack([self._get_frame(idx + i) for i in range(self.seq_len)])
-        return frames   # [T, C, H, W]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        pred = torch.stack([self._get_frame(idx + i) for i in range(self.pred_len)])
+
+        n = len(self.paths)
+        if self.random_context:
+            c_start = int(torch.randint(0, n - self.n_context + 1, (1,)).item())
+        else:
+            c_start = 0
+        context = torch.stack([self._get_frame(c_start + i) for i in range(self.n_context)])
+
+        return context, pred   # [n_context, C, H, W], [pred_len, C, H, W]
 
     def _get_frame(self, i: int) -> torch.Tensor:
         if self._cache is not None:
@@ -216,9 +241,11 @@ class FVMSequenceDataset(Dataset):
         return (raw - self.mean) / self.std
 
     @classmethod
-    def with_cache(cls, sim_dir: Path, renderer: MeshRenderer, seq_len: int,
+    def with_cache(cls, sim_dir: Path, renderer: MeshRenderer,
+                   n_context: int, pred_len: int,
                    mean: torch.Tensor, std: torch.Tensor,
-                   first_frame: int = 20) -> "FVMSequenceDataset":
+                   first_frame: int = 20,
+                   random_context: bool = True) -> "FVMSequenceDataset":
         """Pre-render and cache all frames in memory for fast repeated access."""
         files = sorted(
             [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
@@ -232,7 +259,8 @@ class FVMSequenceDataset(Dataset):
             vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
             raw  = renderer.render_cell_smooth(vals)
             cache.append((raw - m) / s)
-        return cls(sim_dir, renderer, seq_len, mean, std, first_frame, frame_cache=cache)
+        return cls(sim_dir, renderer, n_context, pred_len, mean, std,
+                   first_frame, frame_cache=cache, random_context=random_context)
 
 
 # ---------------------------------------------------------------------------
@@ -246,10 +274,11 @@ class FVMDataModule:
 
     Usage
     -----
-    dm = FVMDataModule(data_dir, seq_len=7, batch_size=4)
+    dm = FVMDataModule(data_dir, n_context=5, horizon=4, batch_size=4)
     dm.setup()
-    for batch in dm.train_dataloader():
-        frames = [batch[:, t] for t in range(batch.shape[1])]  # list of [B,C,H,W]
+    for context, pred in dm.train_dataloader():
+        context_frames = [context[:, t] for t in range(context.shape[1])]  # [B,C,H,W]
+        pred_frames    = [pred[:, t]    for t in range(pred.shape[1])]      # [B,C,H,W]
     """
 
     STATS_FILE = 'hfm_input_stats.json'
@@ -257,22 +286,27 @@ class FVMDataModule:
     def __init__(
         self,
         data_dir:    Path,
-        seq_len:     int,
+        n_context:   int,
+        horizon:     int,
         resolution:  tuple[int, int] = (256, 256),
         batch_size:  int = 4,
         num_workers: int = 4,
         first_frame: int = 20,
         cache_frames: bool = False,
+        random_context: bool = True,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
     ):
-        self.data_dir     = Path(data_dir)
-        self.seq_len      = seq_len
-        self.resolution   = resolution
-        self.batch_size   = batch_size
-        self.num_workers  = num_workers
-        self.first_frame  = first_frame
-        self.cache_frames = cache_frames
+        self.data_dir       = Path(data_dir)
+        self.n_context      = n_context
+        self.horizon        = horizon
+        self.pred_len       = horizon + 1          # seed + horizon targets
+        self.resolution     = resolution
+        self.batch_size     = batch_size
+        self.num_workers    = num_workers
+        self.first_frame    = first_frame
+        self.cache_frames   = cache_frames
+        self.random_context = random_context
         self._dataset: Optional[ConcatDataset] = None
         self.mean: Optional[torch.Tensor] = mean
         self.std:  Optional[torch.Tensor] = std
@@ -310,12 +344,13 @@ class FVMDataModule:
             lambda *a, **kw: FVMSequenceDataset(*a, **kw)
         )
         datasets = [
-            builder(d, renderer, self.seq_len, self.mean, self.std, self.first_frame)
+            builder(d, renderer, self.n_context, self.pred_len, self.mean, self.std,
+                    self.first_frame, random_context=self.random_context)
             for d in sim_dirs
         ]
         datasets = [ds for ds in datasets if len(ds) > 0]
         if not datasets:
-            raise RuntimeError('No usable sequences found — try reducing seq_len or first_frame')
+            raise RuntimeError('No usable sequences found — try reducing horizon or first_frame')
         self._dataset = ConcatDataset(datasets)
         print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} runs')
 

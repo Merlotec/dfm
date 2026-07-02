@@ -30,8 +30,9 @@ def main():
     )
 
     B, C, H, W = 2, cfg.in_channels, cfg.img_size, cfg.img_size
-    seq_len = cfg.n_context_frames + 1 + cfg.horizon
-    frames = [torch.randn(B, C, H, W) for _ in range(seq_len)]
+    # decoupled context (n_context frames) + prediction window (seed + horizon)
+    context_frames = [torch.randn(B, C, H, W) for _ in range(cfg.n_context_frames)]
+    pred_frames    = [torch.randn(B, C, H, W) for _ in range(cfg.horizon + 1)]
     pixel_mask = torch.ones(1, 1, H, W, dtype=torch.bool)
     pixel_mask[..., :4, :] = False  # a few 'hole' pixels
 
@@ -45,8 +46,8 @@ def main():
 
     # --- forward shape check ---
     with torch.no_grad():
-        ctx = trainer.context_encoder(frames[:cfg.n_context_frames], pixel_mask=pixel_mask)
-        preds = trainer.model(frames[cfg.n_context_frames], ctx, pixel_mask=pixel_mask)
+        ctx = trainer.context_encoder(context_frames, pixel_mask=pixel_mask)
+        preds = trainer.model(pred_frames[0], ctx, pixel_mask=pixel_mask)
     assert len(preds) == cfg.horizon, f'expected {cfg.horizon} preds, got {len(preds)}'
     for i, p in enumerate(preds):
         assert p.shape == (B, C, H, W), f'pred {i} wrong shape: {p.shape}'
@@ -55,13 +56,13 @@ def main():
 
     # --- reconstruction-only step (adv off) ---
     trainer.gan_start_step = 10  # force adv_weight = 0
-    recon, disc = trainer.step(frames, pixel_mask=pixel_mask)
+    recon, disc = trainer.step(context_frames, pred_frames, pixel_mask=pixel_mask)
     print(f'\nRecon-only step:  recon={recon:.4f}  disc={disc:.4f}')
     assert recon == recon, 'recon loss is NaN'
 
     # --- GAN step (adv on) ---
     trainer.gan_start_step = 0
-    recon, disc = trainer.step(frames, pixel_mask=pixel_mask)
+    recon, disc = trainer.step(context_frames, pred_frames, pixel_mask=pixel_mask)
     print(f'GAN step:         recon={recon:.4f}  disc={disc:.4f}  '
           f'adv_w={trainer.training_info()["adv_weight"]:.3f}')
     assert recon == recon, 'recon loss is NaN'
