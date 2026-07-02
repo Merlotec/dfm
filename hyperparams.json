@@ -31,8 +31,8 @@
     "n_context_frames": 5,
     "ctx_patch_px": 16,
     "d_ctx": 512,
-    "n_ctx_tokens": 128,
-    "n_ctx_layers": 6,
+    "n_ctx_tokens": 16,
+    "n_ctx_layers": 4,
     "n_ctx_heads": 8,
 
     "disc_dim": 256,
