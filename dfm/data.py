@@ -354,24 +354,33 @@ class FVMDataModule:
         self._dataset = ConcatDataset(datasets)
         print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} runs')
 
+    def _num_workers(self) -> int:
+        # When frames are cached in RAM, __getitem__ is a cheap index+normalise,
+        # so worker processes give no speedup — and forking them would each
+        # inherit the multi-GB cache, exhausting a memory-limited job (fork
+        # ENOMEM).  Load in-process instead.
+        return 0 if self.cache_frames else self.num_workers
+
     def train_dataloader(self) -> DataLoader:
         assert self._dataset is not None, 'Call setup() first'
+        w = self._num_workers()
         return DataLoader(
             self._dataset,
             batch_size         = self.batch_size,
             shuffle            = True,
-            num_workers        = self.num_workers,
+            num_workers        = w,
             pin_memory         = True,
-            persistent_workers = self.num_workers > 0,
+            persistent_workers = w > 0,
         )
 
     def val_dataloader(self) -> DataLoader:
         assert self._dataset is not None, 'Call setup() first'
+        w = self._num_workers()
         return DataLoader(
             self._dataset,
             batch_size         = self.batch_size,
             shuffle            = False,
-            num_workers        = self.num_workers,
+            num_workers        = w,
             pin_memory         = True,
-            persistent_workers = self.num_workers > 0,
+            persistent_workers = w > 0,
         )

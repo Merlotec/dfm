@@ -52,8 +52,8 @@
 
     "l1_weight": 0.1,
 
-    "num_workers": 12,
-    "cache_frames": true,
+    "num_workers": 8,
+    "cache_frames": false,
     "compile": true
   }
 }
