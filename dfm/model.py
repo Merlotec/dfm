@@ -85,8 +85,15 @@ class HFM1D(nn.Module):
         horizon: Optional[int] = None,
         reencode_every: Optional[int] = None,
         pixel_mask: Optional[torch.Tensor] = None,
-    ) -> List[torch.Tensor]:
-        """x0: [B, C, H, W], context: [B, K, d_ctx] → list of `horizon` frames."""
+        return_slots: bool = False,
+    ):
+        """
+        x0: [B, C, H, W], context: [B, K, d_ctx] → list of `horizon` frames.
+
+        If return_slots, also return the per-step evolved slots (the latent that
+        was decoded at each step) — used as the prediction for the latent-
+        consistency loss.
+        """
         horizon = horizon or self.cfg.horizon
         m = reencode_every if reencode_every is not None else self.cfg.reencode_every
 
@@ -97,8 +104,11 @@ class HFM1D(nn.Module):
         slots = self.encode(x0, pixel_mask)
 
         preds: List[torch.Tensor] = []
+        slot_seq: List[torch.Tensor] = []
         for i in range(horizon):
             slots = self.evolution(slots, context, i)
+            if return_slots:
+                slot_seq.append(slots)
             pred  = self.decoder(slots, skip_feats)
             preds.append(pred)
 
@@ -108,4 +118,6 @@ class HFM1D(nn.Module):
                 skip_feats = self.skip_encoder(anchor)
                 slots = self.encode(pred, pixel_mask)
 
+        if return_slots:
+            return preds, slot_seq
         return preds

@@ -20,7 +20,8 @@
     "reencode_every_min": 1,
     "reencode_every_max": 5,
 
-    "n_dec_layers": 4,
+    "n_dec_layers": 2,
+    "n_smooth_layers": 2,
     "skip_ch": 32,
 
     "horizon": 4,
@@ -54,6 +55,7 @@
     "clip_grad": 1.0,
 
     "l1_weight": 0.1,
+    "latent_loss_weight": 0.1,
 
     "num_workers": 4,
     "cache_frames": false

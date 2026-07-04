@@ -37,7 +37,8 @@ def main():
     pixel_mask[..., :4, :] = False  # a few 'hole' pixels
 
     trainer = RolloutGANTrainer(cfg, gan_start_step=0, gan_ramp_steps=1,
-                                disc_update_threshold=0.0, pixel_mask=pixel_mask)
+                                disc_update_threshold=0.0, latent_loss_weight=0.1,
+                                pixel_mask=pixel_mask)
 
     n_params = lambda m: sum(p.numel() for p in m.parameters())
     print(f'HFM1D:          {n_params(trainer.model)/1e3:.1f}K params')

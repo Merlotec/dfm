@@ -1,17 +1,25 @@
 """
-SlotDecoder: evolved slot tokens → image frame.
+SlotDecoder: evolved slot tokens → image frame — a *renderer*, not a physics engine.
 
-Two stages:
+Design (see the "smoothing without physics" rationale):
 
-  1. Slot expansion.  A grid of learned patch-position queries cross-attends to
-     the slots, re-materialising a P×P grid of patch tokens from the compact
-     latent.  This is the inverse of the encoder's Perceiver distillation.
+  1. Slot readout (cross-attention only).  Learned patch-position queries
+     cross-attend to the slots, per position.  With NO self-attention here, the
+     positions never interact, so this stage cannot perform spatial dynamics
+     (advection/diffusion need positions to talk) — it can only render whatever
+     state the evolved slots already encode.
 
-  2. Overlapping-patch synthesis.  Each patch token predicts a 3p/2 × 3p/2 pixel
-     region; the overlapping predictions are blended with a bilinear tent kernel
-     (tent-weighted F.fold, normalised by a pre-computed denominator).  A
-     residual post-conv fuses in the shallow skip features (the initial-frame
-     detail anchor) to recover sub-patch structure and remove block artefacts.
+  2. Slot-blind smoothing.  A few local self-attention layers mix neighbouring
+     patch tokens, but they never see the slots / context / step and are
+     step-agnostic + local — so they can smooth seams and enforce coherence but
+     cannot do time-evolution.
+
+  3. Overlapping-patch synthesis.  Tent-weighted F.fold blends the overlapping
+     patch predictions; a residual post-conv fuses the shallow skip features
+     (initial-frame detail anchor) for sub-patch structure.
+
+Because physics requires (dynamics access) × (spatial reach) and neither stage
+has both, all temporal dynamics are forced into the evolved slots.
 """
 
 import torch
@@ -103,25 +111,20 @@ class OverlappingPatchDecoder(nn.Module):
         return output + self.post_conv(post_in)
 
 
-class _DecoderBlock(nn.Module):
-    """One decoder layer: read the slots (cross-attn), then mix patches (self-attn)."""
+class _ReadoutBlock(nn.Module):
+    """Slot readout: patch queries cross-attend to the slots (per-position, no spatial reach)."""
 
     def __init__(self, cfg: HFM1DConfig):
         super().__init__()
         self.cross = CrossAttnBlock(cfg.d_model, cfg.d_model, cfg.n_heads,
                                     cfg.mlp_ratio, cfg.dropout)
-        self.self_attn = LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.n_patch,
-                                            cfg.local_attn_radius,
-                                            cfg.mlp_ratio, cfg.dropout)
 
     def forward(self, q: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-        q = self.cross(q, slots)      # patch queries read the slot latent
-        q = self.self_attn(q)         # patch tokens mix spatially
-        return q
+        return self.cross(q, slots)
 
 
 class SlotDecoder(nn.Module):
-    """Slots → patch grid (cross- + self-attention layers) → image (overlapping-patch fold)."""
+    """Slots → (readout) → (slot-blind smoothing) → image (overlapping-patch fold)."""
 
     pos: torch.Tensor
 
@@ -135,8 +138,16 @@ class SlotDecoder(nn.Module):
         self.query = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
         self.register_buffer('pos', sincos_2d(P, cfg.d_model).unsqueeze(0),
                              persistent=False)                   # [1, P², d]
-        self.layers = nn.ModuleList([
-            _DecoderBlock(cfg) for _ in range(cfg.n_dec_layers)
+
+        # (1) slot readout: cross-attention only — reads the dynamics, no spatial reach
+        self.readout = nn.ModuleList([
+            _ReadoutBlock(cfg) for _ in range(cfg.n_dec_layers)
+        ])
+        # (2) slot-blind smoother: local self-attention — spatial reach, no dynamics access
+        self.smooth = nn.ModuleList([
+            LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, P, cfg.local_attn_radius,
+                               cfg.mlp_ratio, cfg.dropout)
+            for _ in range(cfg.n_smooth_layers)
         ])
         nn.init.trunc_normal_(self.query, std=0.02)
 
@@ -150,8 +161,10 @@ class SlotDecoder(nn.Module):
         P = self.cfg.n_patch
 
         q = self.query.expand(B, P * P, -1) + self.pos      # [B, P², d]
-        for layer in self.layers:
-            q = layer(q, slots)                             # cross-attn → self-attn
+        for blk in self.readout:
+            q = blk(q, slots)                               # read slots (per-position)
+        for blk in self.smooth:
+            q = blk(q)                                      # slot-blind local smoothing
         patch_tokens = q.reshape(B, P, P, self.cfg.d_model)
 
         return self.synth(patch_tokens, skip_feats)

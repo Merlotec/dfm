@@ -37,8 +37,9 @@ class HFM1DConfig:
     reencode_every_min: int = 1   # training: re-anchor cadence ~ Uniform{min .. max} (0 = never)
     reencode_every_max: int = 4
 
-    # --- decoder (slots → image) ---
-    n_dec_layers: int = 2     # cross-attn(read slots) + self-attn(mix patches) layers
+    # --- decoder (slots → image): a renderer, not a physics engine ---
+    n_dec_layers: int = 2     # slot-readout layers (cross-attention only, no spatial reasoning)
+    n_smooth_layers: int = 2  # slot-blind local self-attention smoothing layers
     skip_ch: int = 32         # shallow skip-encoder channels (initial-frame anchor)
 
     # --- training rollout ---

@@ -73,6 +73,7 @@ def train_step_gan(
     reencode_every: int,
     horizon_gamma: float = 1.0,
     adv_weight: float = 0.0,
+    latent_loss_weight: float = 0.0,
     clip_grad: float = 1.0,
     pixel_mask: Optional[torch.Tensor] = None,
     disc_update_threshold: float = 0.5,
@@ -102,10 +103,17 @@ def train_step_gan(
                            device=x0.device)
     weights = weights / weights.sum()
 
+    use_latent = latent_loss_weight > 0.0
+    slot_seq: List[torch.Tensor] = []
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         context = context_encoder(context_frames, pixel_mask=pixel_mask)
-        preds   = model(x0, context, horizon=horizon,
-                        reencode_every=reencode_every, pixel_mask=pixel_mask)
+        if use_latent:
+            preds, slot_seq = model(x0, context, horizon=horizon,
+                                    reencode_every=reencode_every,
+                                    pixel_mask=pixel_mask, return_slots=True)
+        else:
+            preds = model(x0, context, horizon=horizon,
+                          reencode_every=reencode_every, pixel_mask=pixel_mask)
 
     preds_masked = [
         (p.float() * pixel_mask if pixel_mask is not None else p.float())
@@ -124,13 +132,28 @@ def train_step_gan(
             loss = loss + weights[i] * criterion(preds[i], targets[i])
         return loss
 
+    def _latent() -> torch.Tensor:
+        # Consistency: the evolved slots at step i must match the encoder's
+        # representation of the true next frame (detached target).  This forces
+        # the dynamics into the evolution operator rather than the decoder.
+        if not use_latent:
+            return torch.zeros((), device=x0.device)
+        loss = torch.zeros((), device=x0.device)
+        for i in range(horizon):
+            with torch.no_grad(), torch.autocast(device_type=device_type,
+                                                 dtype=torch.bfloat16, enabled=amp):
+                target_slots = model.encode(targets[i], pixel_mask)
+            loss = loss + weights[i] * F.mse_loss(slot_seq[i].float(), target_slots.float())
+        return loss
+
     # ---- reconstruction only ----
     if adv_weight == 0.0:
         recon_loss = _recon()
-        if not torch.isfinite(recon_loss):
+        gen_loss   = recon_loss + latent_loss_weight * _latent()
+        if not torch.isfinite(gen_loss):
             _zero_and_restore()
             return float('nan'), 0.0
-        recon_loss.backward()
+        gen_loss.backward()
         if clip_grad > 0:
             nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(context_encoder.parameters()), clip_grad
@@ -183,6 +206,7 @@ def train_step_gan(
         total_loss = recon_loss + adv_weight * adv_loss
     else:
         total_loss = recon_loss
+    total_loss = total_loss + latent_loss_weight * _latent()
 
     if not torch.isfinite(total_loss):
         _zero_and_restore()
@@ -214,6 +238,7 @@ class RolloutGANTrainer:
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         l1_weight: float = 0.1,
+        latent_loss_weight: float = 0.0,
         gan_start_step: int = 10_000,
         gan_ramp_steps: int = 2_000,
         disc_update_threshold: float = 0.5,
@@ -237,6 +262,7 @@ class RolloutGANTrainer:
         self.gan_ramp_steps        = gan_ramp_steps
         self.disc_update_threshold = disc_update_threshold
         self.clip_grad             = clip_grad
+        self.latent_loss_weight    = latent_loss_weight
         self.global_step           = 0
 
     def _current_adv_weight(self) -> float:
@@ -283,6 +309,7 @@ class RolloutGANTrainer:
             reencode_every=reencode_every,
             horizon_gamma=self.cfg.horizon_gamma,
             adv_weight=self._current_adv_weight(),
+            latent_loss_weight=self.latent_loss_weight,
             clip_grad=self.clip_grad,
             pixel_mask=pixel_mask,
             disc_update_threshold=self.disc_update_threshold,
