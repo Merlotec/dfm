@@ -9,7 +9,7 @@ import torch.nn as nn
 from einops import rearrange
 from typing import List
 
-from .attention import CrossAttention
+from .attention import CrossAttention, LocalSelfAttention2D
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +49,7 @@ class PatchEmbed(nn.Module):
 
 
 class LearnedPos2D(nn.Module):
-    """Additive learned 2-D positional bias."""
+    """Additive learned 2-D positional bias (resolution-specific; kept for reference)."""
 
     def __init__(self, h: int, w: int, dim: int):
         super().__init__()
@@ -58,6 +58,27 @@ class LearnedPos2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.pos
+
+
+def sincos_2d(grid: int, dim: int) -> torch.Tensor:
+    """
+    Deterministic 2-D sinusoidal positional encoding → [grid*grid, dim].
+
+    Half the channels encode the row coordinate, half the column, each with the
+    standard sin/cos frequency ladder.  Being a fixed function of position (not a
+    learned parameter), it is recomputed for any grid size, so it carries no
+    resolution-specific weights.
+    """
+    assert dim % 4 == 0, "dim must be divisible by 4 for 2-D sin-cos"
+
+    def _1d(pos: torch.Tensor, d: int) -> torch.Tensor:
+        omega = 1.0 / (10000 ** (torch.arange(d // 2, dtype=torch.float) / (d // 2)))
+        ang = pos[:, None].float() * omega[None, :]
+        return torch.cat([ang.sin(), ang.cos()], dim=1)          # [N, d]
+
+    rows = torch.arange(grid).repeat_interleave(grid)            # [grid²]
+    cols = torch.arange(grid).repeat(grid)                        # [grid²]
+    return torch.cat([_1d(rows, dim // 2), _1d(cols, dim // 2)], dim=1)  # [grid², dim]
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +116,26 @@ class SelfAttnBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         n = self.norm1(x)
         x = x + self.attn(n, n, n, need_weights=False)[0]
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class LocalSelfAttnBlock(nn.Module):
+    """Pre-norm local (2r+1)² windowed self-attention with 2-D RoPE + FFN.
+
+    Operates on a flattened P×P patch grid: input/output [B, P*P, dim].
+    """
+
+    def __init__(self, dim: int, n_heads: int, grid: int, radius: int = 1,
+                 mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn  = LocalSelfAttention2D(dim, n_heads, grid, radius, dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn   = FeedForward(dim, mlp_ratio, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
         x = x + self.ffn(self.norm2(x))
         return x
 

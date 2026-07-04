@@ -14,17 +14,20 @@ from einops import rearrange
 from typing import List, Optional
 
 from .config import HFM1DConfig
-from .modules import PatchEmbed, LearnedPos2D, FeedForward, SelfAttnBlock
+from .modules import PatchEmbed, FeedForward, SelfAttnBlock, sincos_2d
 from .attention import CrossAttention
 
 
 class ContextEncoder(nn.Module):
+    spatial_pos: torch.Tensor
+
     def __init__(self, cfg: HFM1DConfig):
         super().__init__()
         P = cfg.img_size // cfg.ctx_patch_px
 
         self.patch_embed  = PatchEmbed(cfg.in_channels + 1, cfg.ctx_patch_px, cfg.d_ctx)
-        self.spatial_pos  = LearnedPos2D(P, P, cfg.d_ctx)
+        self.register_buffer('spatial_pos', sincos_2d(P, cfg.d_ctx).unsqueeze(0),
+                             persistent=False)             # [1, P², d_ctx]
         self.temporal_pos = nn.Embedding(64, cfg.d_ctx)   # up to 64 input frames
 
         self.layers = nn.ModuleList([
@@ -69,9 +72,8 @@ class ContextEncoder(nn.Module):
             if pixel_mask is not None:
                 frame = frame * pixel_mask
             frame_aug = torch.cat([frame, mask_ch], dim=1)
-            tok = self.spatial_pos(self.patch_embed(frame_aug))  # [B, P, P, d_ctx]
-            tok = rearrange(tok, 'b h w d -> b (h w) d')
-            tok = tok + self.temporal_pos.weight[t]
+            tok = rearrange(self.patch_embed(frame_aug), 'b h w d -> b (h w) d')  # [B, P², d_ctx]
+            tok = tok + self.spatial_pos + self.temporal_pos.weight[t]
             tokens.append(tok)
 
         x = torch.cat(tokens, dim=1)                             # [B, T·P², d_ctx]

@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from typing import List, Optional
 
 from .config import HFM1DConfig
-from .modules import LearnedPos2D, CrossAttnBlock
+from .modules import CrossAttnBlock, LocalSelfAttnBlock, sincos_2d
 
 
 class OverlappingPatchDecoder(nn.Module):
@@ -56,7 +56,8 @@ class OverlappingPatchDecoder(nn.Module):
         centre = kernel / 2.0
         w1d    = (centre - (coords - centre).abs()).clamp(min=0)
         wk_2d  = w1d.unsqueeze(1) * w1d.unsqueeze(0)
-        self.register_buffer('weight_kernel', wk_2d)
+        # deterministic + resolution-shaped → non-persistent
+        self.register_buffer('weight_kernel', wk_2d, persistent=False)
 
         wk_flat  = wk_2d.flatten()
         norm_in  = wk_flat.unsqueeze(0).unsqueeze(-1).expand(1, -1, n * n)
@@ -67,7 +68,7 @@ class OverlappingPatchDecoder(nn.Module):
             stride=patch_size,
             padding=patch_size // 4,
         )
-        self.register_buffer('norm_map', norm_map)
+        self.register_buffer('norm_map', norm_map, persistent=False)
 
     weight_kernel: torch.Tensor
     norm_map: torch.Tensor
@@ -102,21 +103,42 @@ class OverlappingPatchDecoder(nn.Module):
         return output + self.post_conv(post_in)
 
 
+class _DecoderBlock(nn.Module):
+    """One decoder layer: read the slots (cross-attn), then mix patches (self-attn)."""
+
+    def __init__(self, cfg: HFM1DConfig):
+        super().__init__()
+        self.cross = CrossAttnBlock(cfg.d_model, cfg.d_model, cfg.n_heads,
+                                    cfg.mlp_ratio, cfg.dropout)
+        self.self_attn = LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.n_patch,
+                                            cfg.local_attn_radius,
+                                            cfg.mlp_ratio, cfg.dropout)
+
+    def forward(self, q: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        q = self.cross(q, slots)      # patch queries read the slot latent
+        q = self.self_attn(q)         # patch tokens mix spatially
+        return q
+
+
 class SlotDecoder(nn.Module):
-    """Slots → patch grid (cross-attention) → image (overlapping-patch fold)."""
+    """Slots → patch grid (cross- + self-attention layers) → image (overlapping-patch fold)."""
+
+    pos: torch.Tensor
 
     def __init__(self, cfg: HFM1DConfig):
         super().__init__()
         self.cfg = cfg
         P = cfg.n_patch
 
-        # Learned patch-position queries that read the slots
-        self.patch_queries = LearnedPos2D(P, P, cfg.d_model)
-        self.query_base    = nn.Parameter(torch.zeros(1, P * P, cfg.d_model))
-        self.slot_read     = CrossAttnBlock(
-            cfg.d_model, cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout
-        )
-        nn.init.trunc_normal_(self.query_base, std=0.02)
+        # A single shared learned query, made position-specific by a
+        # resolution-agnostic sin-cos encoding (non-persistent buffer).
+        self.query = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
+        self.register_buffer('pos', sincos_2d(P, cfg.d_model).unsqueeze(0),
+                             persistent=False)                   # [1, P², d]
+        self.layers = nn.ModuleList([
+            _DecoderBlock(cfg) for _ in range(cfg.n_dec_layers)
+        ])
+        nn.init.trunc_normal_(self.query, std=0.02)
 
         self.synth = OverlappingPatchDecoder(
             cfg.d_model, cfg.in_channels, cfg.img_size, cfg.patch_px, cfg.skip_ch
@@ -127,9 +149,9 @@ class SlotDecoder(nn.Module):
         B = slots.shape[0]
         P = self.cfg.n_patch
 
-        q = self.query_base.expand(B, -1, -1)               # [B, P², d]
-        q = q + self.patch_queries.pos.reshape(1, P * P, -1)
-        patch_tokens = self.slot_read(q, slots)             # [B, P², d]
-        patch_tokens = patch_tokens.reshape(B, P, P, self.cfg.d_model)
+        q = self.query.expand(B, P * P, -1) + self.pos      # [B, P², d]
+        for layer in self.layers:
+            q = layer(q, slots)                             # cross-attn → self-attn
+        patch_tokens = q.reshape(B, P, P, self.cfg.d_model)
 
         return self.synth(patch_tokens, skip_feats)

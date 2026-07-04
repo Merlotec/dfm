@@ -51,12 +51,18 @@ def load_config() -> tuple[HFM1DConfig, dict]:
         n_slots          = m['n_slots'],
         n_heads          = m['n_heads'],
         n_enc_layers     = m['n_enc_layers'],
+        local_attn_radius = m.get('local_attn_radius', 1),
         n_evo_layers     = m['n_evo_layers'],
         integrator       = m['integrator'],
         max_rollout      = m['max_rollout'],
         reencode_every   = m['reencode_every'],
+        reencode_every_min = m.get('reencode_every_min', m['reencode_every']),
+        reencode_every_max = m.get('reencode_every_max', m['reencode_every']),
+        n_dec_layers     = m.get('n_dec_layers', 2),
         skip_ch          = m['skip_ch'],
         horizon          = m['horizon'],
+        horizon_min      = m.get('horizon_min', m['horizon']),
+        horizon_max      = m.get('horizon_max', m['horizon']),
         horizon_gamma    = m['horizon_gamma'],
         noise_std        = m['noise_std'],
         mlp_ratio        = m['mlp_ratio'],
@@ -90,8 +96,8 @@ def main():
     parser.add_argument('--resume',    type=str, default=None, nargs='?', const='latest')
     parser.add_argument('--epochs',    type=int, default=None)
     parser.add_argument('--log-every', type=int, default=50)
-    parser.add_argument('--no-compile', action='store_true',
-                        help='Disable torch.compile even if enabled in hyperparams.json')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Override batch_size from hyperparams.json (handy for local/MPS dev)')
     args = parser.parse_args()
 
     device = get_device()
@@ -100,16 +106,18 @@ def main():
     cfg, train_hp = load_config()
     n_epochs = args.epochs or train_hp['n_epochs']
 
+    batch_size   = args.batch_size or train_hp['batch_size']
     num_workers  = train_hp.get('num_workers', 4)
     cache_frames = train_hp.get('cache_frames', False)
 
     # Context is sampled from a random in-run offset (decoupled from the seed);
-    # prediction windows are seed + horizon targets.
+    # prediction windows are seed + horizon_max targets (rollout length is then
+    # randomly sub-sampled per step in trainer.step).
     dm = FVMDataModule(
         data_dir     = args.data,
         n_context    = cfg.n_context_frames,
-        horizon      = cfg.horizon,
-        batch_size   = train_hp['batch_size'],
+        horizon      = cfg.horizon_max,
+        batch_size   = batch_size,
         num_workers  = num_workers,
         cache_frames = cache_frames,
         random_context = True,
@@ -125,7 +133,7 @@ def main():
             data_dir     = args.test_data,
             n_context    = cfg.n_context_frames,
             horizon      = cfg.horizon,
-            batch_size   = train_hp['batch_size'],
+            batch_size   = batch_size,
             num_workers  = num_workers,
             cache_frames = cache_frames,
             random_context = False,   # deterministic context for stable val loss
@@ -152,11 +160,6 @@ def main():
     )
     trainer.to(device)
 
-    # --- CUDA throughput: TF32 matmuls on the tensor cores ---
-    if device.type == 'cuda':
-        torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.benchmark = True
-
     if args.resume == 'latest':
         candidates = sorted(CKPT_DIR.glob('train_*.pt'))
         if not candidates:
@@ -174,20 +177,11 @@ def main():
     print(f'ContextEncoder:  {n_ctx:.1f}M params')
     print(f'Discriminator:   {n_disc:.1f}M params')
     assert dm._dataset is not None
-    steps_per_epoch = math.ceil(len(dm._dataset) / train_hp['batch_size'])
+    steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:         {len(dm._dataset)} sequences  '
           f'(n_context={cfg.n_context_frames}, horizon={cfg.horizon}, random context offset)')
     print(f'Curriculum:      GAN activates at step {GAN_START_STEP}\n')
-
-    # --- torch.compile last: after load/param-count. Optimizer keeps the same
-    #     Parameter objects, and trainer.save/load unwrap _orig_mod so
-    #     checkpoints stay compatible with uncompiled inference. ---
-    if device.type == 'cuda' and train_hp.get('compile', False) and not args.no_compile:
-        print('Compiling model (first optimised step will be slow)...')
-        trainer.model           = torch.compile(trainer.model)
-        trainer.context_encoder = torch.compile(trainer.context_encoder)
-        trainer.discriminator   = torch.compile(trainer.discriminator)
 
     CKPT_DIR.mkdir(exist_ok=True)
     loss_log_path = CKPT_DIR / 'loss_log.csv'

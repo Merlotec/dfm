@@ -1,59 +1,61 @@
 {
-  "_comment": "DFM latent-rollout hyperparameters — sized to utilise a single RTX 5090 (32 GB).",
-  "_tuning": "batch_size is the fill-to-VRAM knob: raise until ~90% of 32GB (watch nvidia-smi), lower on OOM. Keep gradient_checkpointing true for large batch/horizon.",
+  "_comment": "DFM latent-rollout fluid model hyperparameters (lightweight).",
 
   "model": {
     "img_size": 256,
     "in_channels": 4,
     "patch_px": 16,
 
-    "d_model": 512,
+    "d_model": 384,
     "n_slots": 128,
     "n_heads": 8,
 
     "n_enc_layers": 4,
+    "local_attn_radius": 1,
 
-    "n_evo_layers": 6,
+    "n_evo_layers": 4,
     "integrator": "rk2",
     "max_rollout": 64,
     "reencode_every": 2,
+    "reencode_every_min": 1,
+    "reencode_every_max": 5,
 
-    "skip_ch": 64,
+    "n_dec_layers": 4,
+    "skip_ch": 32,
 
     "horizon": 4,
+    "horizon_min": 2,
+    "horizon_max": 6,
     "horizon_gamma": 1.0,
 
     "noise_std": 0.05,
 
     "mlp_ratio": 4.0,
-    "dropout": 0.02,
+    "dropout": 0.0,
 
     "n_context_frames": 5,
     "ctx_patch_px": 16,
-    "d_ctx": 512,
-    "n_ctx_tokens": 16,
+    "d_ctx": 384,
+    "n_ctx_tokens": 64,
     "n_ctx_layers": 4,
     "n_ctx_heads": 8,
 
-    "disc_dim": 256,
-    "disc_adv_weight": 0.02,
-    "disc_lr": 1e-4,
-
-    "gradient_checkpointing": true
+    "disc_dim": 384,
+    "disc_adv_weight": 0.1,
+    "disc_lr": 1e-4
   },
 
   "training": {
-    "batch_size": 32,
+    "batch_size": 4,
     "n_epochs": 100,
 
-    "lr": 2e-4,
+    "lr": 1e-4,
     "weight_decay": 1e-5,
     "clip_grad": 1.0,
 
     "l1_weight": 0.1,
 
-    "num_workers": 8,
-    "cache_frames": false,
-    "compile": true
+    "num_workers": 4,
+    "cache_frames": false
   }
 }

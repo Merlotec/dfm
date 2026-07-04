@@ -70,6 +70,7 @@ def train_step_gan(
     disc_optimizer: optim.Optimizer,
     criterion: nn.Module,
     horizon: int,
+    reencode_every: int,
     horizon_gamma: float = 1.0,
     adv_weight: float = 0.0,
     clip_grad: float = 1.0,
@@ -103,7 +104,8 @@ def train_step_gan(
 
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         context = context_encoder(context_frames, pixel_mask=pixel_mask)
-        preds   = model(x0, context, horizon=horizon, pixel_mask=pixel_mask)
+        preds   = model(x0, context, horizon=horizon,
+                        reencode_every=reencode_every, pixel_mask=pixel_mask)
 
     preds_masked = [
         (p.float() * pixel_mask if pixel_mask is not None else p.float())
@@ -262,11 +264,23 @@ class RolloutGANTrainer:
         self.context_encoder.train()
         self.discriminator.train()
 
+        # Randomise the rollout length ~ Uniform{horizon_min .. horizon_max}, clamped
+        # to the number of target frames actually provided (pred_frames = seed + targets).
+        hi = min(self.cfg.horizon_max, len(pred_frames) - 1)
+        lo = min(self.cfg.horizon_min, hi)
+        horizon = int(torch.randint(lo, hi + 1, (1,)).item())
+
+        # Randomise the re-anchor cadence ~ Uniform{reencode_every_min .. reencode_every_max}
+        # (0 = never re-anchor within this rollout).
+        r_lo, r_hi = self.cfg.reencode_every_min, self.cfg.reencode_every_max
+        reencode_every = int(torch.randint(r_lo, r_hi + 1, (1,)).item())
+
         recon_loss, disc_loss = train_step_gan(
             self.model, self.context_encoder, self.discriminator,
             context_frames, pred_frames,
             self.gen_optimizer, self.disc_optimizer, self.criterion,
-            horizon=self.cfg.horizon,
+            horizon=horizon,
+            reencode_every=reencode_every,
             horizon_gamma=self.cfg.horizon_gamma,
             adv_weight=self._current_adv_weight(),
             clip_grad=self.clip_grad,
@@ -317,14 +331,10 @@ class RolloutGANTrainer:
         return preds
 
     def save(self, path: str):
-        # Unwrap torch.compile so checkpoints store plain (uncompiled) keys,
-        # keeping them loadable by uncompiled inference.
-        def _u(m):
-            return getattr(m, '_orig_mod', m)
         torch.save({
-            'model':           _u(self.model).state_dict(),
-            'context_encoder': _u(self.context_encoder).state_dict(),
-            'discriminator':   _u(self.discriminator).state_dict(),
+            'model':           self.model.state_dict(),
+            'context_encoder': self.context_encoder.state_dict(),
+            'discriminator':   self.discriminator.state_dict(),
             'gen_optimizer':   self.gen_optimizer.state_dict(),
             'disc_optimizer':  self.disc_optimizer.state_dict(),
             'scheduler':       self.scheduler.state_dict(),
@@ -333,16 +343,28 @@ class RolloutGANTrainer:
         }, path)
 
     def load(self, path: str):
-        def _u(m):
-            return getattr(m, '_orig_mod', m)
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        _u(self.model).load_state_dict(ckpt['model'], strict=False)
+        missing, unexpected = self.model.load_state_dict(ckpt['model'], strict=False)
+        if missing:
+            print(f'  [load] model missing keys (fresh init): {missing}')
+        if unexpected:
+            print(f'  [load] model unexpected keys (ignored): {unexpected}')
         if 'context_encoder' in ckpt:
-            _u(self.context_encoder).load_state_dict(ckpt['context_encoder'], strict=False)
+            self.context_encoder.load_state_dict(ckpt['context_encoder'], strict=False)
         if 'discriminator' in ckpt:
-            _u(self.discriminator).load_state_dict(ckpt['discriminator'], strict=False)
-        self.gen_optimizer.load_state_dict(ckpt['gen_optimizer'])
-        if 'disc_optimizer' in ckpt:
-            self.disc_optimizer.load_state_dict(ckpt['disc_optimizer'])
-        self.scheduler.load_state_dict(ckpt['scheduler'])
+            self.discriminator.load_state_dict(ckpt['discriminator'], strict=False)
+        # Optimizer states are parameter-set-specific; tolerate mismatches from
+        # architecture changes (e.g. a resumed checkpoint predating a new layer).
+        for name, opt in [('gen_optimizer', self.gen_optimizer),
+                          ('disc_optimizer', self.disc_optimizer)]:
+            if name in ckpt:
+                try:
+                    opt.load_state_dict(ckpt[name])
+                except Exception as e:
+                    print(f'  [load] {name} not restored ({e}); continuing with fresh state')
+        if 'scheduler' in ckpt:
+            try:
+                self.scheduler.load_state_dict(ckpt['scheduler'])
+            except Exception as e:
+                print(f'  [load] scheduler not restored ({e})')
         self.global_step = ckpt.get('global_step', 0)

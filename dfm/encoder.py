@@ -17,10 +17,12 @@ import torch.nn as nn
 from einops import rearrange
 
 from .config import HFM1DConfig
-from .modules import PatchEmbed, LearnedPos2D, SelfAttnBlock, CrossAttnBlock
+from .modules import PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, sincos_2d
 
 
 class FrameEncoder(nn.Module):
+    pos: torch.Tensor
+
     def __init__(self, cfg: HFM1DConfig):
         super().__init__()
         self.cfg = cfg
@@ -28,10 +30,13 @@ class FrameEncoder(nn.Module):
 
         # +1 input channel for the geometry mask
         self.patch_embed = PatchEmbed(cfg.in_channels + 1, cfg.patch_px, cfg.d_model)
-        self.spatial_pos = LearnedPos2D(P, P, cfg.d_model)
+        # Resolution-agnostic sin-cos absolute position (non-persistent buffer)
+        self.register_buffer('pos', sincos_2d(P, cfg.d_model).unsqueeze(0),
+                             persistent=False)                  # [1, P², d]
 
         self.layers = nn.ModuleList([
-            SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
+            LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, P, cfg.local_attn_radius,
+                               cfg.mlp_ratio, cfg.dropout)
             for _ in range(cfg.n_enc_layers)
         ])
 
@@ -46,8 +51,8 @@ class FrameEncoder(nn.Module):
         """x_aug: [B, in_channels + 1, H, W]  →  slots [B, n_slots, d_model]."""
         B = x_aug.shape[0]
 
-        tok = self.spatial_pos(self.patch_embed(x_aug))     # [B, P, P, d]
-        tok = rearrange(tok, 'b h w d -> b (h w) d')        # [B, P², d]
+        tok = rearrange(self.patch_embed(x_aug), 'b h w d -> b (h w) d')  # [B, P², d]
+        tok = tok + self.pos
 
         for layer in self.layers:
             tok = layer(tok)

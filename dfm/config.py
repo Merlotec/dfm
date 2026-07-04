@@ -26,17 +26,25 @@ class HFM1DConfig:
     # --- encoder (single frame → slots) ---
     n_enc_layers: int = 4     # self-attention depth over patch tokens
 
+    # --- patch-token self-attention (encoder + decoder) ---
+    local_attn_radius: int = 1  # each patch attends to its (2r+1)² neighbourhood (r=1 → 3×3)
+
     # --- latent evolution operator ---
     n_evo_layers: int = 2     # transformer blocks composing one tendency eval
     integrator: str = 'rk2'   # 'euler' | 'rk2' (midpoint)
     max_rollout: int = 64     # size of the step-index embedding table
-    reencode_every: int = 0   # 0 = never re-encode; else refresh slots every m steps
+    reencode_every: int = 0       # nominal re-anchor cadence (eval / validation / inference)
+    reencode_every_min: int = 1   # training: re-anchor cadence ~ Uniform{min .. max} (0 = never)
+    reencode_every_max: int = 4
 
     # --- decoder (slots → image) ---
+    n_dec_layers: int = 2     # cross-attn(read slots) + self-attn(mix patches) layers
     skip_ch: int = 32         # shallow skip-encoder channels (initial-frame anchor)
 
     # --- training rollout ---
-    horizon: int = 4          # frames predicted per training example
+    horizon: int = 4          # nominal horizon (eval / validation / inference default)
+    horizon_min: int = 2      # training: rollout length ~ Uniform{horizon_min .. horizon_max}
+    horizon_max: int = 6
     horizon_gamma: float = 1.0  # per-step loss discount (1.0 = uniform)
 
     # --- input noise (training only) ---

@@ -83,11 +83,12 @@ class HFM1D(nn.Module):
         x0: torch.Tensor,
         context: torch.Tensor,
         horizon: Optional[int] = None,
+        reencode_every: Optional[int] = None,
         pixel_mask: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """x0: [B, C, H, W], context: [B, K, d_ctx] → list of `horizon` frames."""
         horizon = horizon or self.cfg.horizon
-        m = self.cfg.reencode_every
+        m = reencode_every if reencode_every is not None else self.cfg.reencode_every
 
         if self.training and self.cfg.noise_std > 0.0:
             x0 = x0 + torch.randn_like(x0) * self.cfg.noise_std
@@ -95,20 +96,10 @@ class HFM1D(nn.Module):
         skip_feats = self.skip_encoder(x0 * pixel_mask if pixel_mask is not None else x0)
         slots = self.encode(x0, pixel_mask)
 
-        ckpt = self.cfg.gradient_checkpointing and self.training
-
         preds: List[torch.Tensor] = []
         for i in range(horizon):
-            if ckpt:
-                # Checkpoint the evolve+decode step: the full-resolution decode
-                # activations are the rollout's memory bottleneck, so recomputing
-                # them in backward frees enough memory to fit a much larger batch.
-                slots, pred = _checkpointed_step(
-                    self.evolution, self.decoder, slots, context, skip_feats[0], i
-                )
-            else:
-                slots = self.evolution(slots, context, i)
-                pred  = self.decoder(slots, skip_feats)
+            slots = self.evolution(slots, context, i)
+            pred  = self.decoder(slots, skip_feats)
             preds.append(pred)
 
             if m > 0 and (i + 1) % m == 0 and i + 1 < horizon:
@@ -118,17 +109,3 @@ class HFM1D(nn.Module):
                 slots = self.encode(pred, pixel_mask)
 
         return preds
-
-
-def _checkpointed_step(evolution, decoder, slots, context, skip0, step_idx):
-    """Gradient-checkpointed one-step evolve + decode (see HFM1D.forward)."""
-    from torch.utils.checkpoint import checkpoint
-
-    def _run(slots_in, context_in, skip0_in):
-        new_slots = evolution(slots_in, context_in, step_idx)
-        pred = decoder(new_slots, [skip0_in])
-        return new_slots, pred
-
-    out = checkpoint(_run, slots, context, skip0, use_reentrant=False)
-    assert isinstance(out, tuple)
-    return out
