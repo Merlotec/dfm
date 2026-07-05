@@ -19,15 +19,23 @@ import torch
 
 
 class LoopProfiler:
+    """
+    Measures throughput over each log interval with a *single* CUDA sync (in
+    ``line()``), so it adds no per-step overhead.  ``data-wait`` is the CPU time
+    spent blocked on the dataloader (accurate without a sync); compute is the
+    remaining interval wall-clock.
+    """
+
     def __init__(self, device: torch.device):
         self.device = device
         self.cuda = device.type == 'cuda'
         self._reset()
-        self._t = time.perf_counter()
+        now = time.perf_counter()
+        self._t = now
+        self._interval_start = now
 
     def _reset(self):
         self.data_t = 0.0
-        self.step_t = 0.0
         self.steps = 0
         self.samples = 0
 
@@ -38,20 +46,19 @@ class LoopProfiler:
         self._t = now
 
     def step_done(self, batch_size: int):
-        """Call right after the optimizer step (records compute time)."""
-        if self.cuda:
-            torch.cuda.synchronize()
-        now = time.perf_counter()
-        self.step_t += now - self._t
-        self._t = now
+        """Call right after the optimizer step (no sync — stays async)."""
+        self._t = time.perf_counter()
         self.steps += 1
         self.samples += batch_size
 
     def line(self) -> str:
-        tot = self.data_t + self.step_t
-        its = self.steps / tot if tot > 0 else 0.0
-        sps = self.samples / tot if tot > 0 else 0.0
-        data_pct = 100.0 * self.data_t / tot if tot > 0 else 0.0
+        if self.cuda:
+            torch.cuda.synchronize()          # one sync per log interval, not per step
+        now = time.perf_counter()
+        wall = now - self._interval_start
+        its = self.steps / wall if wall > 0 else 0.0
+        sps = self.samples / wall if wall > 0 else 0.0
+        data_pct = 100.0 * self.data_t / wall if wall > 0 else 0.0
         extra = ''
         if self.cuda:
             peak  = torch.cuda.max_memory_allocated() / 1e9
@@ -64,7 +71,9 @@ class LoopProfiler:
             torch.cuda.reset_peak_memory_stats()
         s = f'{its:.2f} it/s  {sps:.0f} samp/s  data-wait={data_pct:.0f}%{extra}'
         self._reset()
-        self._t = time.perf_counter()
+        now = time.perf_counter()
+        self._t = now
+        self._interval_start = now
         return s
 
 
