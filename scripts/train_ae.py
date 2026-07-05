@@ -118,9 +118,12 @@ def main():
         torch.set_float32_matmul_precision('high')
         torch.backends.cudnn.benchmark = True
         if train_hp.get('compile', False) and not args.no_compile:
-            print('Compiling models (first steps will be slow)...')
-            trainer.ae            = torch.compile(trainer.ae)
-            trainer.discriminator = torch.compile(trainer.discriminator)
+            print('Compiling autoencoder (first steps will be slow)...')
+            # NOTE: leave the discriminator uncompiled — its spectral_norm layers
+            # mutate the power-iteration buffers in place, and calling it twice
+            # (real, then fake) before d_loss.backward() trips torch.compile's
+            # saved-tensor version check ("modified by an inplace operation").
+            trainer.ae = torch.compile(trainer.ae)
 
     n = lambda mod: sum(pp.numel() for pp in mod.parameters()) / 1e6
     print(f'Autoencoder:   {n(trainer.ae):.1f}M params')
