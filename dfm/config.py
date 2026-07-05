@@ -47,8 +47,13 @@ class DFMConfig:
     horizon_max: int = 6
     horizon_gamma: float = 1.0  # per-step loss discount (1.0 = uniform)
 
-    # --- input noise (training only) ---
-    noise_std: float = 0.05
+    # --- latent noise (denoising / rollout-stability regularizer, per-slot relative) ---
+    # Phase 2: perturb the *input* latent L_t during teacher forcing (target stays clean),
+    # so the operator learns to pull off-manifold latents back onto the trajectory → less
+    # rollout drift.  Phase 1: perturb L_t before decode, so the (frozen) decoder tolerates
+    # the dynamics' imperfect latents instead of rendering them as artefacts.
+    latent_noise_std: float = 0.0     # phase-2 dynamics input-latent noise
+    ae_decode_noise_std: float = 0.0  # phase-1 AE pre-decode latent noise
 
     # --- transformer ---
     mlp_ratio: float = 4.0

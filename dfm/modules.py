@@ -164,6 +164,20 @@ class CrossAttnBlock(nn.Module):
 # Ordered / nested slots (Matryoshka-style): per-example monotone weight ramp
 # ---------------------------------------------------------------------------
 
+def add_relative_noise(x: torch.Tensor, std: float) -> torch.Tensor:
+    """Gaussian noise scaled to each token's own RMS (per-slot, scale-invariant).
+
+    Used as a denoising / rollout-stability regularizer on the latent slots: because
+    the noise is proportional to each slot's magnitude, the near-null anchor and the
+    low-energy late slots of an ordered latent are perturbed proportionally, not
+    swamped.  `std` is a fraction of that RMS (e.g. 0.1 → 10 %).
+    """
+    if std <= 0:
+        return x
+    rms = x.detach().float().pow(2).mean(dim=-1, keepdim=True).sqrt()   # [..., 1]
+    return x + std * rms.to(x.dtype) * torch.randn_like(x)
+
+
 def slot_log_bias(weights: torch.Tensor) -> torch.Tensor:
     """Slot weights w_i ∈ [0, 1] → additive cross-attention logit bias log(w_i).
 

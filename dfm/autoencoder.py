@@ -26,7 +26,7 @@ from typing import Optional, Tuple
 
 from .config import DFMConfig
 from .modules import (PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SkipEncoder,
-                      sincos_2d, SlotHierarchyMask, slot_log_bias)
+                      sincos_2d, SlotHierarchyMask, slot_log_bias, add_relative_noise)
 from .decoder import SlotDecoder
 from .discriminator import DFMDiscriminator
 from .losses import FluidLoss
@@ -134,7 +134,10 @@ class LatentAutoencoder(nn.Module):
                 slot_weights: Optional[torch.Tensor] = None
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         latent = self.encode(x0, xt, pixel_mask)
-        return self.decode(x0, latent, pixel_mask, slot_weights), latent
+        # noise the latent the decoder sees (training only); return the clean latent
+        dec_latent = (add_relative_noise(latent, self.cfg.ae_decode_noise_std)
+                      if self.training else latent)
+        return self.decode(x0, dec_latent, pixel_mask, slot_weights), latent
 
 
 # ---------------------------------------------------------------------------

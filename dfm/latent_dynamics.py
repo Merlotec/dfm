@@ -27,6 +27,7 @@ from .evolution import EvolutionOperator
 from .context_encoder import ContextEncoder
 from .encoder import FrameEncoder
 from .autoencoder import LatentAutoencoder
+from .modules import add_relative_noise
 
 
 class LatentDynamics(nn.Module):
@@ -187,6 +188,10 @@ class LatentDynamicsTrainer:
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
             context = self.context_encoder(context_frames, pixel_mask=pixel_mask)
 
+            # denoising regularizer: feed a noised L_t but supervise against the clean
+            # L_{t+1}, so the operator learns to correct off-manifold drift at rollout.
+            ns = self.cfg.latent_noise_std
+
             if self.cfg.evolve_state:
                 # per-step full-state encodings (with grad → trains the encoder via the
                 # delta path); detached copies are the teacher targets for state evolution.
@@ -195,7 +200,7 @@ class LatentDynamicsTrainer:
                 delta_loss = torch.zeros((), device=x0.device)
                 state_loss = torch.zeros((), device=x0.device)
                 for t in range(n):
-                    dp = self.dynamics(latents[t], context, s_proj[t], t)          # L_t → L_{t+1}
+                    dp = self.dynamics(add_relative_noise(latents[t], ns), context, s_proj[t], t)
                     delta_loss = delta_loss + F.mse_loss(dp.float(), latents[t + 1].float())
                     sp = self.dynamics.evolve_state(s_raw[t].detach(), context, t)  # s_t → s_{t+1}
                     state_loss = state_loss + F.mse_loss(sp.float(), s_raw[t + 1].detach().float())
@@ -204,7 +209,7 @@ class LatentDynamicsTrainer:
                 state = self.dynamics.encode_state(x0, pixel_mask)   # fixed anchor s_0
                 loss = torch.zeros((), device=x0.device)
                 for t in range(n):
-                    pred = self.dynamics(latents[t], context, state, t)  # L_t → L_{t+1}
+                    pred = self.dynamics(add_relative_noise(latents[t], ns), context, state, t)
                     loss = loss + F.mse_loss(pred.float(), latents[t + 1].float())
                 loss = loss / max(1, n)
 
