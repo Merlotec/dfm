@@ -1,5 +1,5 @@
 """
-Conditional GAN discriminator for HFM-1D.
+Conditional GAN discriminator for DFM.
 
 Given a predicted (or ground-truth) frame, the true previous frame, and the
 history-context tokens, classify real vs. generated.  A PatchGAN-style strided
@@ -11,10 +11,10 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import spectral_norm
 
-from .config import HFM1DConfig
+from .config import DFMConfig
 
 
-class HFMDiscriminator(nn.Module):
+class DFMDiscriminator(nn.Module):
     """
     frame   : [B, C, H, W]     frame being judged (model output or ground truth)
     x_prev  : [B, C, H, W]     ground-truth previous frame
@@ -22,7 +22,7 @@ class HFMDiscriminator(nn.Module):
     returns : [B, 1]           real/fake logit (use BCEWithLogitsLoss)
     """
 
-    def __init__(self, cfg: HFM1DConfig):
+    def __init__(self, cfg: DFMConfig):
         super().__init__()
         d = cfg.disc_dim
 

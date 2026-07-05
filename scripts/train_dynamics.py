@@ -20,7 +20,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfm import HFM1DConfig, LatentDynamicsTrainer
+from dfm import DFMConfig, LatentDynamicsTrainer
 from dfm.data import FVMDataModule, build_renderer, load_pixel_mask
 from dfm.profiling import LoopProfiler, make_profiler, finish_profiler
 
@@ -33,11 +33,11 @@ CKPT_DIR         = _ROOT / 'checkpoints_dyn'
 HYPERPARAMS      = _ROOT / 'hyperparams.json'
 
 
-def load_config() -> tuple[HFM1DConfig, dict]:
+def load_config() -> tuple[DFMConfig, dict]:
     with open(HYPERPARAMS) as f:
         hp = json.load(f)
     m = {k: v for k, v in hp['model'].items() if not k.startswith('_')}
-    return HFM1DConfig(**m), hp['training']
+    return DFMConfig(**m), hp['training']
 
 
 def get_device() -> torch.device:

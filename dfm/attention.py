@@ -1,5 +1,5 @@
 """
-Attention primitives for HFM-1D.
+Attention primitives for DFM.
 
   - CrossAttention        : queries attend to a separate key/value set.
   - LocalSelfAttention2D  : each patch on a P×P grid attends only to its

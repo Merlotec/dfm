@@ -20,8 +20,7 @@
     "reencode_every_min": 1,
     "reencode_every_max": 5,
 
-    "n_dec_layers": 2,
-    "n_smooth_layers": 2,
+    "n_dec_layers": 4,
     "skip_ch": 32,
 
     "horizon": 4,

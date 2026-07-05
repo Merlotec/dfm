@@ -2,9 +2,9 @@ from dataclasses import dataclass
 
 
 @dataclass
-class HFM1DConfig:
+class DFMConfig:
     """
-    Configuration for the latent-rollout fluid model (HFM-1D).
+    Configuration for the latent-rollout fluid model (DFM).
 
     The model encodes a single frame into a compact set of *slot* tokens, rolls
     those slots forward through a weight-shared latent evolution operator, and
@@ -37,9 +37,8 @@ class HFM1DConfig:
     reencode_every_min: int = 1   # training: re-anchor cadence ~ Uniform{min .. max} (0 = never)
     reencode_every_max: int = 4
 
-    # --- decoder (slots → image): a renderer, not a physics engine ---
-    n_dec_layers: int = 2     # slot-readout layers (cross-attention only, no spatial reasoning)
-    n_smooth_layers: int = 2  # slot-blind local self-attention smoothing layers
+    # --- decoder (slots → image): full transformer (cross + self-attention) ---
+    n_dec_layers: int = 4     # transformer decoder blocks (cross-attn slots + self-attn patches)
     skip_ch: int = 32         # shallow skip-encoder channels (initial-frame anchor)
 
     # --- training rollout ---

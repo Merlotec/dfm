@@ -11,14 +11,14 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfm import HFM1DConfig, AutoencoderTrainer, LatentDynamicsTrainer
+from dfm import DFMConfig, AutoencoderTrainer, LatentDynamicsTrainer
 
 
 def main():
     torch.manual_seed(0)
-    cfg = HFM1DConfig(
+    cfg = DFMConfig(
         img_size=64, patch_px=16, d_model=48, n_slots=8, n_heads=4,
-        n_enc_layers=2, n_evo_layers=1, n_dec_layers=1, n_smooth_layers=1,
+        n_enc_layers=2, n_evo_layers=1, n_dec_layers=1,
         d_ctx=48, n_ctx_tokens=8, n_ctx_layers=1, n_ctx_heads=4,
         disc_dim=16, ae_max_delta=4, n_context_frames=2, horizon_max=6,
     )

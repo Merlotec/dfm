@@ -16,14 +16,14 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from .config import HFM1DConfig
+from .config import DFMConfig
 from .modules import PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, sincos_2d
 
 
 class FrameEncoder(nn.Module):
     pos: torch.Tensor
 
-    def __init__(self, cfg: HFM1DConfig):
+    def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
         P = cfg.n_patch

@@ -24,11 +24,11 @@ import torch.optim as optim
 from einops import rearrange
 from typing import Optional, Tuple
 
-from .config import HFM1DConfig
+from .config import DFMConfig
 from .modules import PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SkipEncoder, sincos_2d
 from .decoder import SlotDecoder
-from .discriminator import HFMDiscriminator
-from .trainer import FluidLoss
+from .discriminator import DFMDiscriminator
+from .losses import FluidLoss
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ class PairEncoder(nn.Module):
 
     pos: torch.Tensor
 
-    def __init__(self, cfg: HFM1DConfig):
+    def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
         P = cfg.n_patch
@@ -83,7 +83,7 @@ class PairEncoder(nn.Module):
 class LatentAutoencoder(nn.Module):
     """encode(X_0, X_t) → L_t ;  decode(X_0, L_t) → X_t."""
 
-    def __init__(self, cfg: HFM1DConfig):
+    def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
         self.encoder      = PairEncoder(cfg)
@@ -135,7 +135,7 @@ class AutoencoderTrainer:
 
     def __init__(
         self,
-        cfg: HFM1DConfig,
+        cfg: DFMConfig,
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         l1_weight: float = 0.1,
@@ -148,7 +148,7 @@ class AutoencoderTrainer:
     ):
         self.cfg           = cfg
         self.ae            = LatentAutoencoder(cfg)
-        self.discriminator = HFMDiscriminator(cfg)
+        self.discriminator = DFMDiscriminator(cfg)
         self.criterion     = FluidLoss(l1_weight, pixel_mask=pixel_mask)
 
         self.gen_optimizer  = optim.AdamW(self.ae.parameters(), lr=lr, weight_decay=weight_decay)

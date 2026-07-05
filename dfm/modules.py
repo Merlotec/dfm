@@ -1,5 +1,5 @@
 """
-Shared building blocks for HFM-1D: feed-forward, patch embedding, learned 2-D
+Shared building blocks for DFM: feed-forward, patch embedding, learned 2-D
 positional bias, a shallow skip encoder, and pre-norm self-/cross-attention
 transformer blocks.
 """

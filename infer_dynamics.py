@@ -27,10 +27,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dfm import HFM1DConfig, LatentDynamicsTrainer
+from dfm import DFMConfig, LatentDynamicsTrainer
 from dfm.data import build_renderer, FVMSequenceDataset, load_pixel_mask
-# reuse the plotting / io helpers from the HFM1D inference script
-from infer import get_device, load_stats, denorm, find_sim_dirs, save_images, save_viewer_frames
+from dfm.inference_utils import (get_device, load_stats, denorm, find_sim_dirs,
+                                 save_images, save_viewer_frames)
 
 
 def main():
@@ -57,7 +57,7 @@ def main():
     # ---- load checkpoint (dynamics + context + frozen AE) ----
     print(f'\nLoading checkpoint: {args.checkpoint}')
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    cfg: HFM1DConfig = ckpt['cfg']
+    cfg: DFMConfig = ckpt['cfg']
     trainer = LatentDynamicsTrainer(cfg).to(device)
     trainer.load(args.checkpoint)
     n_context = args.n_context if args.n_context is not None else cfg.n_context_frames

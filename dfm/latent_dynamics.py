@@ -22,7 +22,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from typing import List, Optional
 
-from .config import HFM1DConfig
+from .config import DFMConfig
 from .evolution import EvolutionOperator
 from .context_encoder import ContextEncoder
 from .encoder import FrameEncoder
@@ -40,7 +40,7 @@ class LatentDynamics(nn.Module):
     "which dynamics" (context) and "current state" (s_0).
     """
 
-    def __init__(self, cfg: HFM1DConfig):
+    def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
         self.operator       = EvolutionOperator(cfg)     # evolves the delta latent L_t
@@ -93,7 +93,7 @@ class LatentDynamicsTrainer:
 
     def __init__(
         self,
-        cfg: HFM1DConfig,
+        cfg: DFMConfig,
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         clip_grad: float = 1.0,

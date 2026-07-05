@@ -19,14 +19,14 @@ dynamics are then learned as a residual.
 import torch
 import torch.nn as nn
 
-from .config import HFM1DConfig
+from .config import DFMConfig
 from .modules import SelfAttnBlock, CrossAttnBlock
 
 
 class _TendencyBlock(nn.Module):
     """One block: slot self-mixing followed by context read-in."""
 
-    def __init__(self, cfg: HFM1DConfig):
+    def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.self_blk  = SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
         self.cross_blk = CrossAttnBlock(cfg.d_model, cfg.d_ctx, cfg.n_heads,
@@ -39,7 +39,7 @@ class _TendencyBlock(nn.Module):
 class _Tendency(nn.Module):
     """Computes dS = f(S, context): slot self-mixing + context read-in."""
 
-    def __init__(self, cfg: HFM1DConfig):
+    def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.blocks = nn.ModuleList([_TendencyBlock(cfg) for _ in range(cfg.n_evo_layers)])
         self.norm = nn.LayerNorm(cfg.d_model)
@@ -56,7 +56,7 @@ class _Tendency(nn.Module):
 
 
 class EvolutionOperator(nn.Module):
-    def __init__(self, cfg: HFM1DConfig):
+    def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
         self.tendency  = _Tendency(cfg)

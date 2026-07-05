@@ -1,5 +1,5 @@
 """
-FVM dataset for HFM training.
+FVM dataset for DFM training.
 
 Each item is a [T, C, H, W] tensor of T consecutive normalised, rendered frames
 from one simulation run.  T must be >= n_warmup_frames + 2 so the trainer has

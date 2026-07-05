@@ -13,7 +13,7 @@ import torch.nn as nn
 from einops import rearrange
 from typing import List, Optional
 
-from .config import HFM1DConfig
+from .config import DFMConfig
 from .modules import PatchEmbed, FeedForward, SelfAttnBlock, sincos_2d
 from .attention import CrossAttention
 
@@ -21,7 +21,7 @@ from .attention import CrossAttention
 class ContextEncoder(nn.Module):
     spatial_pos: torch.Tensor
 
-    def __init__(self, cfg: HFM1DConfig):
+    def __init__(self, cfg: DFMConfig):
         super().__init__()
         P = cfg.img_size // cfg.ctx_patch_px
 
