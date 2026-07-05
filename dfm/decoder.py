@@ -112,9 +112,10 @@ class _DecoderBlock(nn.Module):
                                         cfg.mlp_ratio, cfg.dropout)
         self.self_attn = SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
 
-    def forward(self, q: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-        q = self.cross(q, slots)      # read the slot latent
-        q = self.self_attn(q)         # coordinate patches globally
+    def forward(self, q: torch.Tensor, slots: torch.Tensor,
+                key_bias: torch.Tensor | None = None) -> torch.Tensor:
+        q = self.cross(q, slots, key_bias=key_bias)   # read the (masked) slot latent
+        q = self.self_attn(q)                          # coordinate patches globally
         return q
 
 
@@ -134,23 +135,30 @@ class SlotDecoder(nn.Module):
         self.register_buffer('pos', sincos_2d(P, cfg.d_model).unsqueeze(0),
                              persistent=False)                   # [1, P², d]
 
+        # Learned per-slot rank embedding: gives each slot a stable identity so the
+        # decoder knows *which* rank it is reading/attenuating (ordered-slot anchor).
+        self.rank_embed = nn.Parameter(torch.zeros(1, cfg.n_slots, cfg.d_model))
+
         self.layers = nn.ModuleList([
             _DecoderBlock(cfg) for _ in range(cfg.n_dec_layers)
         ])
         nn.init.trunc_normal_(self.query, std=0.02)
+        nn.init.trunc_normal_(self.rank_embed, std=0.02)
 
         self.synth = OverlappingPatchDecoder(
             cfg.d_model, cfg.in_channels, cfg.img_size, cfg.patch_px, cfg.skip_ch
         )
 
     def forward(self, slots: torch.Tensor,
-                skip_feats: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+                skip_feats: Optional[List[torch.Tensor]] = None,
+                key_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         B = slots.shape[0]
         P = self.cfg.n_patch
 
+        slots = slots + self.rank_embed                     # tag each slot with its rank
         q = self.query.expand(B, P * P, -1) + self.pos      # [B, P², d]
         for layer in self.layers:
-            q = layer(q, slots)                             # cross-attn → self-attn
+            q = layer(q, slots, key_bias)                   # cross-attn (masked) → self-attn
         patch_tokens = q.reshape(B, P, P, self.cfg.d_model)
 
         return self.synth(patch_tokens, skip_feats)

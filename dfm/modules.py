@@ -10,6 +10,7 @@ from einops import rearrange
 from typing import List
 
 from .attention import CrossAttention, LocalSelfAttention2D
+from .config import DFMConfig
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +153,57 @@ class CrossAttnBlock(nn.Module):
         self.norm2   = nn.LayerNorm(q_dim)
         self.ffn     = FeedForward(q_dim, mlp_ratio, dropout)
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        q = q + self.attn(self.norm_q(q), self.norm_kv(kv))
+    def forward(self, q: torch.Tensor, kv: torch.Tensor,
+                key_bias: torch.Tensor | None = None) -> torch.Tensor:
+        q = q + self.attn(self.norm_q(q), self.norm_kv(kv), key_bias=key_bias)
         q = q + self.ffn(self.norm2(q))
         return q
+
+
+# ---------------------------------------------------------------------------
+# Ordered / nested slots (Matryoshka-style): per-example monotone weight ramp
+# ---------------------------------------------------------------------------
+
+def slot_log_bias(weights: torch.Tensor) -> torch.Tensor:
+    """Slot weights w_i ∈ [0, 1] → additive cross-attention logit bias log(w_i).
+
+    w=1 → bias 0 (slot fully readable); w=0 → −inf (slot removed from the softmax).
+    """
+    return torch.log(weights.clamp_min(0.0))
+
+
+class SlotHierarchyMask(nn.Module):
+    """
+    Samples per-example monotone slot weights that induce an *ordered* latent.
+
+    For each example we draw a ramp zero-crossing c and set
+
+        w_i = clamp(1 - i/c, 0, 1)        (slot 0 → 1.0, decreasing, 0 for i ≥ c)
+
+    so low-index slots are (almost) always present while high-index slots are
+    randomly attenuated/dropped — the pressure that front-loads information.
+    With probability ``slot_full_prob`` the full, unattenuated ramp (all ones) is
+    used instead, keeping full-width decoding in-distribution.
+    """
+
+    idx: torch.Tensor
+
+    def __init__(self, cfg: DFMConfig):
+        super().__init__()
+        self.n_slots    = cfg.n_slots
+        self.full_prob  = cfg.slot_full_prob
+        self.cutoff_min = cfg.slot_cutoff_min
+        self.register_buffer('idx', torch.arange(cfg.n_slots).float(), persistent=False)
+
+    def sample(self, batch: int, device: torch.device) -> torch.Tensor:
+        """Random training weights [batch, n_slots]."""
+        idx = self.idx.to(device).view(1, -1)                              # [1, K]
+        c   = torch.empty(batch, 1, device=device).uniform_(self.cutoff_min, self.n_slots)
+        w   = (1.0 - idx / c).clamp(0.0, 1.0)                              # [B, K]
+        full = torch.rand(batch, 1, device=device) < self.full_prob
+        return torch.where(full, torch.ones_like(w), w)
+
+    def hard(self, batch: int, n_active: int, device: torch.device) -> torch.Tensor:
+        """Deterministic prefix mask: keep the first `n_active` slots (inference dial)."""
+        keep = (self.idx.to(device) < n_active).float().view(1, -1)
+        return keep.expand(batch, -1)

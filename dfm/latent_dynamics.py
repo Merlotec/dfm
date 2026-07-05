@@ -230,14 +230,20 @@ class LatentDynamicsTrainer:
     @torch.no_grad()
     def rollout(self, context_frames: List[torch.Tensor], x0: torch.Tensor,
                 n_steps: int, reencode_every: int = 0,
-                pixel_mask: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+                pixel_mask: Optional[torch.Tensor] = None,
+                n_active_slots: Optional[int] = None) -> List[torch.Tensor]:
         """
         Inference: roll the latent forward and decode.  Latent starts at
         L_0 = encode(X_0, X_0) (zero evolution); every `reencode_every` steps the
         anchor is reset to the latest prediction (0 = never).
+
+        `n_active_slots` (ordered-slot hierarchy only): decode from just the first
+        N slots — the compute/quality dial that a nested latent enables.
         """
         self.ae.eval(); self.context_encoder.eval(); self.dynamics.eval()
         context = self.context_encoder(context_frames, pixel_mask=pixel_mask)
+        slot_w  = (self.ae.slot_mask.hard(x0.shape[0], n_active_slots, x0.device)
+                   if n_active_slots is not None else None)
         anchor  = x0
         latent  = self.ae.encode(anchor, anchor, pixel_mask)
         s_raw   = self.dynamics.encode_state_raw(anchor, pixel_mask)  # s_0 for this anchor
@@ -247,7 +253,7 @@ class LatentDynamicsTrainer:
                 s_raw = self.dynamics.evolve_state(s_raw, context, i)  # evolve state in latent (no decode)
             state  = self.dynamics.project_state(s_raw)
             latent = self.dynamics(latent, context, state, i)
-            pred   = self.ae.decode(anchor, latent, pixel_mask)
+            pred   = self.ae.decode(anchor, latent, pixel_mask, slot_w)
             if pixel_mask is not None:
                 pred = pred * pixel_mask
             preds.append(pred)

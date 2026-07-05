@@ -67,6 +67,15 @@ class DFMConfig:
     evolve_state: bool = False    # also evolve the anchor-state embedding s_t in latent
     state_loss_weight: float = 1.0  # weight of the (teacher-forced) state-prediction loss
 
+    # --- ordered / nested slots (Matryoshka-style; variable token count at inference) ---
+    # When on, the decoder reads the slots through a per-example monotone weight ramp
+    # w_i = clamp(1 - i/c, 0, 1) applied as an additive log-bias on the cross-attention
+    # logits (w=0 → true removal).  The random cutoff c front-loads information into the
+    # low-index slots, so the latent can be truncated to any width at inference.
+    slot_hierarchy: bool = False
+    slot_full_prob: float = 0.25   # fraction of steps trained at full width (all slots, w=1)
+    slot_cutoff_min: float = 1.0   # min ramp zero-crossing c (>=1 → slot 0 always fully active)
+
     # --- GAN discriminator ---
     disc_dim: int = 128
     disc_adv_weight: float = 0.02

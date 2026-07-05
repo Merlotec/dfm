@@ -23,6 +23,10 @@
     "n_dec_layers": 4,
     "skip_ch": 32,
 
+    "slot_hierarchy": true,
+    "slot_full_prob": 0.25,
+    "slot_cutoff_min": 1.0,
+
     "horizon": 4,
     "horizon_min": 2,
     "horizon_max": 6,

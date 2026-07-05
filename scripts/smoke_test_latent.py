@@ -21,6 +21,7 @@ def main():
         n_enc_layers=2, n_evo_layers=1, n_dec_layers=1,
         d_ctx=48, n_ctx_tokens=8, n_ctx_layers=1, n_ctx_heads=4,
         disc_dim=16, ae_max_delta=4, n_context_frames=2, horizon_max=6,
+        slot_hierarchy=True, slot_full_prob=0.25,
     )
     B, C, H, W = 2, cfg.in_channels, cfg.img_size, cfg.img_size
     pm = torch.ones(1, 1, H, W, dtype=torch.bool); pm[..., :4, :] = False
@@ -46,6 +47,16 @@ def main():
     ae_grad = sum(p.grad.norm().item() for p in ae_tr.ae.parameters() if p.grad is not None)
     assert ae_grad > 0, 'AE got no gradient'
     print(f'AE param grad (sum): {ae_grad:.3e}')
+
+    # --- ordered-slot hierarchy: decode from a truncated slot prefix ---
+    with torch.no_grad():
+        L = ae_tr.ae.encode(x0, xt, pm)
+        for n_active in (1, cfg.n_slots // 2, cfg.n_slots):
+            w = ae_tr.ae.slot_mask.hard(B, n_active, x0.device)
+            xh = ae_tr.ae.decode(x0, L, pm, w)
+            assert xh.shape == (B, C, H, W) and torch.isfinite(xh).all(), n_active
+            print(f'  decode with {n_active}/{cfg.n_slots} slots: '
+                  f'mean|x|={xh.abs().mean():.4f}')
 
     # ================= Phase 2: latent dynamics (BPTT-free) =================
     ctx_frames  = [torch.randn(B, C, H, W) for _ in range(cfg.n_context_frames)]
@@ -75,6 +86,12 @@ def main():
         preds = dyn_tr.rollout(ctx_frames, x0, n_steps=3, reencode_every=2, pixel_mask=pm)
         assert len(preds) == 3 and preds[0].shape == (B, C, H, W)
         print(f'  rollout: {len(preds)} frames, each {tuple(preds[0].shape)}')
+
+        # truncated-slot rollout (inference compute/quality dial)
+        preds_tr = dyn_tr.rollout(ctx_frames, x0, n_steps=3, reencode_every=2,
+                                  pixel_mask=pm, n_active_slots=cfg.n_slots // 2)
+        assert len(preds_tr) == 3 and torch.isfinite(preds_tr[0]).all()
+        print(f'  rollout @ {cfg.n_slots // 2}/{cfg.n_slots} slots: ok')
 
         # checkpoint round-trip (both modes)
         dyn_tr.save('/tmp/dyn_smoke.pt'); dyn_tr.load('/tmp/dyn_smoke.pt')

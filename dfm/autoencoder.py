@@ -25,7 +25,8 @@ from einops import rearrange
 from typing import Optional, Tuple
 
 from .config import DFMConfig
-from .modules import PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SkipEncoder, sincos_2d
+from .modules import (PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SkipEncoder,
+                      sincos_2d, SlotHierarchyMask, slot_log_bias)
 from .decoder import SlotDecoder
 from .discriminator import DFMDiscriminator
 from .losses import FluidLoss
@@ -89,7 +90,14 @@ class LatentAutoencoder(nn.Module):
         self.encoder      = PairEncoder(cfg)
         self.skip_encoder = SkipEncoder(cfg.in_channels, cfg.skip_ch)
         self.decoder      = SlotDecoder(cfg)          # decode(L, skip(X_0))
+        self.slot_mask    = SlotHierarchyMask(cfg)    # ordered-slot weight sampler
         self._init_weights()
+
+    def sample_slot_weights(self, batch: int, device: torch.device) -> Optional[torch.Tensor]:
+        """Training slot weights [B, n_slots] (None when the hierarchy is off)."""
+        if not self.cfg.slot_hierarchy:
+            return None
+        return self.slot_mask.sample(batch, device)
 
     def _init_weights(self):
         for m in self.modules():
@@ -115,15 +123,18 @@ class LatentAutoencoder(nn.Module):
         return self.encoder(x0, xt, pixel_mask)
 
     def decode(self, x0: torch.Tensor, latent: torch.Tensor,
-               pixel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+               pixel_mask: Optional[torch.Tensor] = None,
+               slot_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         skip = self.skip_encoder(x0 * pixel_mask if pixel_mask is not None else x0)
-        return self.decoder(latent, skip)
+        key_bias = slot_log_bias(slot_weights) if slot_weights is not None else None
+        return self.decoder(latent, skip, key_bias)
 
     def forward(self, x0: torch.Tensor, xt: torch.Tensor,
-                pixel_mask: Optional[torch.Tensor] = None
+                pixel_mask: Optional[torch.Tensor] = None,
+                slot_weights: Optional[torch.Tensor] = None
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         latent = self.encode(x0, xt, pixel_mask)
-        return self.decode(x0, latent, pixel_mask), latent
+        return self.decode(x0, latent, pixel_mask, slot_weights), latent
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +197,12 @@ class AutoencoderTrainer:
         self.gen_optimizer.zero_grad()
         self.disc_optimizer.zero_grad()
 
+        # ordered-slot mask: sample per-example monotone weights (None when off) so the
+        # decoder is trained to reconstruct from a random low-rank prefix of the slots.
+        slot_weights = self.ae.sample_slot_weights(x0.shape[0], x0.device)
+
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-            xhat, _ = self.ae(x0, xt, pixel_mask)
+            xhat, _ = self.ae(x0, xt, pixel_mask, slot_weights)
         xhat_masked = xhat.float() * pixel_mask if pixel_mask is not None else xhat.float()
 
         # discriminator conditions on the anchor X_0 only (constant zero context)

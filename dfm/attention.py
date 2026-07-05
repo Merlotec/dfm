@@ -14,10 +14,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _scaled_dot(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """q/k/v: [..., L, head_dim].  Returns [..., Lq, head_dim]."""
+def _scaled_dot(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                bias: torch.Tensor | None = None) -> torch.Tensor:
+    """q/k/v: [..., L, head_dim].  Returns [..., Lq, head_dim].
+
+    `bias` (if given) is an additive logit bias broadcastable to [..., Lq, Lk] —
+    used for the ordered-slot mask, where a −inf entry removes that key entirely.
+    """
     scale = math.sqrt(q.shape[-1])
     attn = torch.matmul(q, k.transpose(-2, -1)) / scale
+    if bias is not None:
+        attn = attn + bias.to(attn.dtype)
     attn = F.softmax(attn, dim=-1)
     return torch.matmul(attn, v)
 
@@ -174,7 +181,8 @@ class CrossAttention(nn.Module):
         self.out_proj = nn.Linear(q_dim, q_dim, bias=False)
         self.drop     = nn.Dropout(dropout)
 
-    def forward(self, queries: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(self, queries: torch.Tensor, context: torch.Tensor,
+                key_bias: torch.Tensor | None = None) -> torch.Tensor:
         B, Lq, _ = queries.shape
         Lk = context.shape[1]
         nh, hd = self.n_heads, self.head_dim
@@ -183,5 +191,7 @@ class CrossAttention(nn.Module):
         k = self.k_proj(context).reshape(B, Lk, nh, hd).transpose(1, 2)
         v = self.v_proj(context).reshape(B, Lk, nh, hd).transpose(1, 2)
 
-        out = _scaled_dot(q, k, v).transpose(1, 2).reshape(B, Lq, nh * hd)
+        # per-key additive logit bias [B, Lk] → broadcast over heads and queries
+        bias = key_bias.reshape(B, 1, 1, Lk) if key_bias is not None else None
+        out = _scaled_dot(q, k, v, bias).transpose(1, 2).reshape(B, Lq, nh * hd)
         return self.drop(self.out_proj(out))
