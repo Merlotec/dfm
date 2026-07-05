@@ -143,6 +143,7 @@ class AutoencoderTrainer:
         gan_ramp_steps: int = 2_000,
         disc_update_threshold: float = 0.5,
         clip_grad: float = 1.0,
+        total_steps: Optional[int] = None,
         pixel_mask: Optional[torch.Tensor] = None,
     ):
         self.cfg           = cfg
@@ -153,7 +154,8 @@ class AutoencoderTrainer:
         self.gen_optimizer  = optim.AdamW(self.ae.parameters(), lr=lr, weight_decay=weight_decay)
         self.disc_optimizer = optim.Adam(self.discriminator.parameters(),
                                          lr=cfg.disc_lr, betas=(0.5, 0.999))
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.gen_optimizer, T_max=10_000)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.gen_optimizer, T_max=total_steps or 1_000_000)
 
         self.gan_start_step        = gan_start_step
         self.gan_ramp_steps        = gan_ramp_steps
@@ -275,9 +277,10 @@ class AutoencoderTrainer:
         return total / count if count else float('nan')
 
     def save(self, path: str):
+        def _u(m): return getattr(m, '_orig_mod', m)   # unwrap torch.compile
         torch.save({
-            'ae':             self.ae.state_dict(),
-            'discriminator':  self.discriminator.state_dict(),
+            'ae':             _u(self.ae).state_dict(),
+            'discriminator':  _u(self.discriminator).state_dict(),
             'gen_optimizer':  self.gen_optimizer.state_dict(),
             'disc_optimizer': self.disc_optimizer.state_dict(),
             'scheduler':      self.scheduler.state_dict(),
@@ -286,10 +289,11 @@ class AutoencoderTrainer:
         }, path)
 
     def load(self, path: str):
+        def _u(m): return getattr(m, '_orig_mod', m)
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        self.ae.load_state_dict(ckpt['ae'], strict=False)
+        _u(self.ae).load_state_dict(ckpt['ae'], strict=False)
         if 'discriminator' in ckpt:
-            self.discriminator.load_state_dict(ckpt['discriminator'], strict=False)
+            _u(self.discriminator).load_state_dict(ckpt['discriminator'], strict=False)
         for name, opt in [('gen_optimizer', self.gen_optimizer),
                           ('disc_optimizer', self.disc_optimizer)]:
             if name in ckpt:

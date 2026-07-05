@@ -58,6 +58,7 @@
     "latent_loss_weight": 0.1,
 
     "num_workers": 4,
-    "cache_frames": false
+    "cache_frames": false,
+    "compile": true
   }
 }

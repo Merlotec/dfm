@@ -243,6 +243,7 @@ class RolloutGANTrainer:
         gan_ramp_steps: int = 2_000,
         disc_update_threshold: float = 0.5,
         clip_grad: float = 1.0,
+        total_steps: Optional[int] = None,
         pixel_mask: Optional[torch.Tensor] = None,
     ):
         self.cfg             = cfg
@@ -256,7 +257,9 @@ class RolloutGANTrainer:
         self.disc_optimizer = optim.Adam(
             self.discriminator.parameters(), lr=cfg.disc_lr, betas=(0.5, 0.999)
         )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.gen_optimizer, T_max=10_000)
+        # T_max = whole run so the LR anneals once (avoids the cosine sawtooth).
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.gen_optimizer, T_max=total_steps or 1_000_000)
 
         self.gan_start_step        = gan_start_step
         self.gan_ramp_steps        = gan_ramp_steps

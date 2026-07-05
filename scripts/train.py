@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfm import HFM1DConfig, RolloutGANTrainer
 from dfm.data import FVMDataModule, build_renderer, load_pixel_mask
+from dfm.profiling import LoopProfiler, make_profiler, finish_profiler
 
 _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'
@@ -99,6 +100,8 @@ def main():
     parser.add_argument('--log-every', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=None,
                         help='Override batch_size from hyperparams.json (handy for local/MPS dev)')
+    parser.add_argument('--profile', type=int, default=0, metavar='N',
+                        help='Profile the first N steps with torch.profiler, print a kernel breakdown, then exit')
     args = parser.parse_args()
 
     device = get_device()
@@ -124,6 +127,9 @@ def main():
         random_context = True,
     )
     dm.setup()
+    assert dm._dataset is not None
+    steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
+    total_steps     = steps_per_epoch * n_epochs   # single cosine decay over the whole run
 
     renderer   = build_renderer(args.data, (cfg.img_size, cfg.img_size))
     pixel_mask = load_pixel_mask(args.data, renderer, (cfg.img_size, cfg.img_size)).to(device)
@@ -158,6 +164,7 @@ def main():
         gan_start_step        = GAN_START_STEP,
         gan_ramp_steps        = GAN_RAMP_STEPS,
         disc_update_threshold = DISC_UPDATE_THRESHOLD,
+        total_steps           = total_steps,
         pixel_mask            = pixel_mask,
     )
     trainer.to(device)
@@ -178,8 +185,6 @@ def main():
     print(f'Generator:       {n_gen:.1f}M params')
     print(f'ContextEncoder:  {n_ctx:.1f}M params')
     print(f'Discriminator:   {n_disc:.1f}M params')
-    assert dm._dataset is not None
-    steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:         {len(dm._dataset)} sequences  '
           f'(n_context={cfg.n_context_frames}, horizon={cfg.horizon}, random context offset)')
@@ -195,14 +200,20 @@ def main():
         loss_csv.flush()
 
     nan_streak = 0
+    prof  = LoopProfiler(device)
+    tprof = make_profiler(args.profile > 0, device)
     for epoch in range(start_epoch, n_epochs):
         recon_sum, recon_cnt = 0.0, 0
         for context_b, pred_b in dm.train_dataloader():
+            prof.data_ready()
             context_frames = [context_b[:, t].to(device) for t in range(context_b.shape[1])]
             pred_frames    = [pred_b[:, t].to(device)    for t in range(pred_b.shape[1])]
             recon, disc = trainer.step(context_frames, pred_frames, pixel_mask=pixel_mask)
+            prof.step_done(pred_b.shape[0])
             info = trainer.training_info()
             step = info['global_step']
+            if tprof is not None and step >= args.profile:
+                finish_profiler(tprof, device, CKPT_DIR); return
 
             if not math.isfinite(recon):
                 nan_streak += 1
@@ -217,7 +228,7 @@ def main():
             recon_cnt += 1
             if step % args.log_every == 0:
                 print(f'epoch {epoch:3d}  step {step:6d} | recon={recon:.4f}  '
-                      f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}')
+                      f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}  |  {prof.line()}')
 
         train_loss = recon_sum / recon_cnt if recon_cnt else float('nan')
         val_loss   = trainer.validate(val_dl, pixel_mask=val_pixel_mask) if val_dl else float('nan')

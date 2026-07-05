@@ -267,6 +267,20 @@ class FVMSequenceDataset(Dataset):
 # Multi-run data module (plain PyTorch, no Lightning dependency)
 # ---------------------------------------------------------------------------
 
+class _IndexedDataset(Dataset):
+    """Wraps a dataset so each item is (global_index, *item) — for latent caching."""
+
+    def __init__(self, ds: Dataset):
+        self.ds = ds
+
+    def __len__(self) -> int:
+        return len(self.ds)  # type: ignore[arg-type]
+
+    def __getitem__(self, i: int):
+        item = self.ds[i]
+        return (i, *item) if isinstance(item, tuple) else (i, item)
+
+
 class FVMDataModule:
     """
     Scans a dataset directory for simulation subdirectories, builds a renderer,
@@ -294,6 +308,7 @@ class FVMDataModule:
         first_frame: int = 20,
         cache_frames: bool = False,
         random_context: bool = True,
+        return_index: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
     ):
@@ -307,6 +322,7 @@ class FVMDataModule:
         self.first_frame    = first_frame
         self.cache_frames   = cache_frames
         self.random_context = random_context
+        self.return_index   = return_index         # yield (idx, context, pred) for latent caching
         self._dataset: Optional[ConcatDataset] = None
         self.mean: Optional[torch.Tensor] = mean
         self.std:  Optional[torch.Tensor] = std
@@ -361,11 +377,14 @@ class FVMDataModule:
         # ENOMEM).  Load in-process instead.
         return 0 if self.cache_frames else self.num_workers
 
+    def _wrap(self, ds):
+        return _IndexedDataset(ds) if self.return_index else ds
+
     def train_dataloader(self) -> DataLoader:
         assert self._dataset is not None, 'Call setup() first'
         w = self._num_workers()
         return DataLoader(
-            self._dataset,
+            self._wrap(self._dataset),
             batch_size         = self.batch_size,
             shuffle            = True,
             num_workers        = w,
@@ -377,7 +396,7 @@ class FVMDataModule:
         assert self._dataset is not None, 'Call setup() first'
         w = self._num_workers()
         return DataLoader(
-            self._dataset,
+            self._wrap(self._dataset),
             batch_size         = self.batch_size,
             shuffle            = False,
             num_workers        = w,

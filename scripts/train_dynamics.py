@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfm import HFM1DConfig, LatentDynamicsTrainer
 from dfm.data import FVMDataModule, build_renderer, load_pixel_mask
+from dfm.profiling import LoopProfiler, make_profiler, finish_profiler
 
 _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'
@@ -58,6 +59,10 @@ def main():
     p.add_argument('--log-every',  type=int, default=50)
     p.add_argument('--evolve-state', action='store_true',
                    help='Also evolve the state embedding s_t in latent (optional second stream)')
+    p.add_argument('--no-compile', action='store_true',
+                   help='Disable torch.compile even if enabled in hyperparams.json')
+    p.add_argument('--profile', type=int, default=0, metavar='N',
+                   help='Profile the first N steps with torch.profiler, print a kernel breakdown, then exit')
     args = p.parse_args()
 
     device = get_device()
@@ -71,11 +76,15 @@ def main():
     num_workers  = train_hp.get('num_workers', 4)
     cache_frames = train_hp.get('cache_frames', False)
 
-    # pred window = [X_0, X_1, ..., X_{horizon_max}]  (the anchored sequence)
+    # pred window = [X_0, X_1, ..., X_{horizon_max}]  (the anchored sequence).
+    # return_index enables the frozen-AE latent cache in the trainer.
     dm = FVMDataModule(args.data, n_context=cfg.n_context_frames, horizon=cfg.horizon_max,
                        batch_size=batch_size, num_workers=num_workers,
-                       cache_frames=cache_frames, random_context=True)
+                       cache_frames=cache_frames, random_context=True, return_index=True)
     dm.setup()
+    assert dm._dataset is not None
+    steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
+    total_steps     = steps_per_epoch * n_epochs
     renderer   = build_renderer(args.data, (cfg.img_size, cfg.img_size))
     pixel_mask = load_pixel_mask(args.data, renderer, (cfg.img_size, cfg.img_size)).to(device)
 
@@ -92,7 +101,8 @@ def main():
 
     trainer = LatentDynamicsTrainer(
         cfg, lr=train_hp['lr'], weight_decay=train_hp['weight_decay'],
-        clip_grad=train_hp['clip_grad'], pixel_mask=pixel_mask,
+        clip_grad=train_hp['clip_grad'], total_steps=total_steps,
+        pixel_mask=pixel_mask,
     ).to(device)
 
     print(f'Loading frozen AE: {args.ae}')
@@ -106,12 +116,20 @@ def main():
         print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
 
+    # --- CUDA throughput: TF32 + torch.compile (kernel fusion) ---
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cudnn.benchmark = True
+        if train_hp.get('compile', False) and not args.no_compile:
+            print('Compiling models (first steps will be slow)...')
+            trainer.dynamics        = torch.compile(trainer.dynamics)
+            trainer.context_encoder = torch.compile(trainer.context_encoder)
+            trainer.ae              = torch.compile(trainer.ae)
+
     n = lambda mod: sum(pp.numel() for pp in mod.parameters()) / 1e6
     print(f'Dynamics:       {n(trainer.dynamics):.1f}M params')
     print(f'ContextEncoder: {n(trainer.context_encoder):.1f}M params')
     print(f'AE (frozen):    {n(trainer.ae):.1f}M params')
-    assert dm._dataset is not None
-    steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:        {len(dm._dataset)} sequences  (latent MSE, teacher forced, no BPTT)\n')
 
@@ -120,18 +138,24 @@ def main():
     if (CKPT_DIR / 'dyn_loss_log.csv').stat().st_size == 0:
         w.writerow(['epoch', 'train_latent_mse', 'val_latent_mse']); log.flush()
 
+    prof  = LoopProfiler(device)
+    tprof = make_profiler(args.profile > 0, device)
     for epoch in range(start_epoch, n_epochs):
         lsum, lcnt = 0.0, 0
-        for context_b, pred_b in dm.train_dataloader():
+        for idx_b, context_b, pred_b in dm.train_dataloader():
+            prof.data_ready()
             context_frames = [context_b[:, t].to(device) for t in range(context_b.shape[1])]
             pred_frames    = [pred_b[:, t].to(device)    for t in range(pred_b.shape[1])]
-            loss = trainer.step(context_frames, pred_frames, pixel_mask=pixel_mask)
+            loss = trainer.step(context_frames, pred_frames, pixel_mask=pixel_mask, index=idx_b)
+            prof.step_done(pred_b.shape[0])
             step = trainer.global_step
+            if tprof is not None and step >= args.profile:
+                finish_profiler(tprof, device, CKPT_DIR); return
             if not math.isfinite(loss):
                 print(f'  [WARN] step {step}: NaN latent loss'); continue
             lsum += loss; lcnt += 1
             if step % args.log_every == 0:
-                print(f'epoch {epoch:3d}  step {step:6d} | latent_mse={loss:.5f}')
+                print(f'epoch {epoch:3d}  step {step:6d} | latent_mse={loss:.5f}  |  {prof.line()}')
 
         train_l = lsum / lcnt if lcnt else float('nan')
         val_l = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')

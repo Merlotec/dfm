@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfm import HFM1DConfig, AutoencoderTrainer
 from dfm.data import FVMDataModule, build_renderer, load_pixel_mask
+from dfm.profiling import LoopProfiler, make_profiler, finish_profiler
 
 _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'
@@ -60,6 +61,10 @@ def main():
     p.add_argument('--epochs',     type=int, default=None)
     p.add_argument('--batch-size', type=int, default=None)
     p.add_argument('--log-every',  type=int, default=50)
+    p.add_argument('--no-compile', action='store_true',
+                   help='Disable torch.compile even if enabled in hyperparams.json')
+    p.add_argument('--profile', type=int, default=0, metavar='N',
+                   help='Profile the first N steps with torch.profiler, print a kernel breakdown, then exit')
     args = p.parse_args()
 
     device = get_device()
@@ -75,6 +80,9 @@ def main():
                        batch_size=batch_size, num_workers=num_workers,
                        cache_frames=cache_frames, random_context=True)
     dm.setup()
+    assert dm._dataset is not None
+    steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
+    total_steps     = steps_per_epoch * n_epochs
     renderer   = build_renderer(args.data, (cfg.img_size, cfg.img_size))
     pixel_mask = load_pixel_mask(args.data, renderer, (cfg.img_size, cfg.img_size)).to(device)
 
@@ -93,7 +101,8 @@ def main():
         cfg, lr=train_hp['lr'], weight_decay=train_hp['weight_decay'],
         l1_weight=train_hp['l1_weight'], clip_grad=train_hp['clip_grad'],
         gan_start_step=GAN_START_STEP, gan_ramp_steps=GAN_RAMP_STEPS,
-        disc_update_threshold=DISC_UPDATE_THRESHOLD, pixel_mask=pixel_mask,
+        disc_update_threshold=DISC_UPDATE_THRESHOLD, total_steps=total_steps,
+        pixel_mask=pixel_mask,
     ).to(device)
 
     CKPT_DIR.mkdir(exist_ok=True)
@@ -104,11 +113,18 @@ def main():
         print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
 
+    # --- CUDA throughput: TF32 + torch.compile ---
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cudnn.benchmark = True
+        if train_hp.get('compile', False) and not args.no_compile:
+            print('Compiling models (first steps will be slow)...')
+            trainer.ae            = torch.compile(trainer.ae)
+            trainer.discriminator = torch.compile(trainer.discriminator)
+
     n = lambda mod: sum(pp.numel() for pp in mod.parameters()) / 1e6
     print(f'Autoencoder:   {n(trainer.ae):.1f}M params')
     print(f'Discriminator: {n(trainer.discriminator):.1f}M params')
-    assert dm._dataset is not None
-    steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:       {len(dm._dataset)} sequences  (ae_max_delta={cfg.ae_max_delta})')
     print(f'Curriculum:    GAN activates at step {GAN_START_STEP}\n')
@@ -118,22 +134,28 @@ def main():
     if (CKPT_DIR / 'ae_loss_log.csv').stat().st_size == 0:
         w.writerow(['epoch', 'train_recon', 'val_recon']); log.flush()
 
+    prof  = LoopProfiler(device)
+    tprof = make_profiler(args.profile > 0, device)
     for epoch in range(start_epoch, n_epochs):
         rsum, rcnt = 0.0, 0
         for _, pred_b in dm.train_dataloader():
+            prof.data_ready()
             npred = pred_b.shape[1] - 1                        # frames after X_0
             t = int(torch.randint(1, npred + 1, (1,)).item()) # Δt ~ Uniform{1..npred}
             x0 = pred_b[:, 0].to(device)
             xt = pred_b[:, t].to(device)
             recon, disc = trainer.step(x0, xt, pixel_mask=pixel_mask)
+            prof.step_done(pred_b.shape[0])
             step = trainer.global_step
+            if tprof is not None and step >= args.profile:
+                finish_profiler(tprof, device, CKPT_DIR); return
             if not math.isfinite(recon):
                 print(f'  [WARN] step {step}: NaN recon'); continue
             rsum += recon; rcnt += 1
             if step % args.log_every == 0:
                 info = trainer.training_info()
                 print(f'epoch {epoch:3d}  step {step:6d} | recon={recon:.4f}  '
-                      f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}')
+                      f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}  |  {prof.line()}')
 
         train_recon = rsum / rcnt if rcnt else float('nan')
         val_recon = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')

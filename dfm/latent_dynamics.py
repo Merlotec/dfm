@@ -97,6 +97,7 @@ class LatentDynamicsTrainer:
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         clip_grad: float = 1.0,
+        total_steps: Optional[int] = None,
         pixel_mask: Optional[torch.Tensor] = None,
     ):
         self.cfg             = cfg
@@ -111,9 +112,16 @@ class LatentDynamicsTrainer:
 
         params = list(self.dynamics.parameters()) + list(self.context_encoder.parameters())
         self.optimizer = optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=10_000)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=total_steps or 1_000_000)
         self.clip_grad = clip_grad
         self.global_step = 0
+
+        # Cache of frozen-AE target latents, keyed by window index (fp16, CPU).
+        # The AE is frozen, so L_t = encode(X_0, X_t) is fixed — encode once (epoch 0),
+        # reuse thereafter, skipping the per-step pair-encodes entirely.
+        self.cache_latents = True
+        self._latent_cache: dict = {}
 
     def to(self, device: torch.device) -> "LatentDynamicsTrainer":
         self.ae              = self.ae.to(device)
@@ -138,12 +146,30 @@ class LatentDynamicsTrainer:
                 latents.append(self.ae.encode(x0, xt, pixel_mask).detach())
         return latents
 
+    def _cached_targets(self, x0, pred_frames, pixel_mask, index) -> List[torch.Tensor]:
+        """L_t targets, served from the frozen-AE cache when available."""
+        if index is None or not self.cache_latents:
+            return self._encode_targets(x0, pred_frames, pixel_mask)
+        device = x0.device
+        idxs = index.tolist()
+        pred_len = len(pred_frames)
+        if all(i in self._latent_cache for i in idxs):
+            cached = [self._latent_cache[i] for i in idxs]            # each [pred_len, K, d] fp16 cpu
+            return [torch.stack([c[t] for c in cached]).to(device).float() for t in range(pred_len)]
+        latents = self._encode_targets(x0, pred_frames, pixel_mask)   # list_t of [B, K, d]
+        for bi, i in enumerate(idxs):
+            self._latent_cache[i] = torch.stack(
+                [latents[t][bi] for t in range(pred_len)]).half().cpu()
+        return latents
+
     def step(self, context_frames: List[torch.Tensor],
              pred_frames: List[torch.Tensor],
-             pixel_mask: Optional[torch.Tensor] = None) -> float:
+             pixel_mask: Optional[torch.Tensor] = None,
+             index: Optional[torch.Tensor] = None) -> float:
         """
         context_frames : history frames  → ContextEncoder → context
         pred_frames    : [X_0, X_1, ..., X_n]  (anchor + future)
+        index          : per-window global indices (enables the frozen-AE latent cache)
 
         Returns the mean single-step latent MSE.
         """
@@ -153,8 +179,8 @@ class LatentDynamicsTrainer:
         amp = device_type == 'cuda'
 
         x0 = pred_frames[0]
-        # anchored latent sequence  L_0 (= encode(X_0,X_0)) .. L_n
-        latents = self._encode_targets(x0, pred_frames, pixel_mask)   # detached
+        # anchored latent sequence  L_0 (= encode(X_0,X_0)) .. L_n  (cached; detached)
+        latents = self._cached_targets(x0, pred_frames, pixel_mask, index)
         n = len(latents) - 1
 
         self.optimizer.zero_grad()
@@ -257,10 +283,11 @@ class LatentDynamicsTrainer:
         return total / count if count else float('nan')
 
     def save(self, path: str):
+        def _u(m): return getattr(m, '_orig_mod', m)   # unwrap torch.compile
         torch.save({
-            'dynamics':        self.dynamics.state_dict(),
-            'context_encoder': self.context_encoder.state_dict(),
-            'ae':              self.ae.state_dict(),   # frozen, stored for standalone inference
+            'dynamics':        _u(self.dynamics).state_dict(),
+            'context_encoder': _u(self.context_encoder).state_dict(),
+            'ae':              _u(self.ae).state_dict(),   # frozen, stored for standalone inference
             'optimizer':       self.optimizer.state_dict(),
             'scheduler':       self.scheduler.state_dict(),
             'cfg':             self.cfg,
@@ -268,12 +295,13 @@ class LatentDynamicsTrainer:
         }, path)
 
     def load(self, path: str):
+        def _u(m): return getattr(m, '_orig_mod', m)
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        self.dynamics.load_state_dict(ckpt['dynamics'], strict=False)
+        _u(self.dynamics).load_state_dict(ckpt['dynamics'], strict=False)
         if 'context_encoder' in ckpt:
-            self.context_encoder.load_state_dict(ckpt['context_encoder'], strict=False)
+            _u(self.context_encoder).load_state_dict(ckpt['context_encoder'], strict=False)
         if 'ae' in ckpt:
-            self.ae.load_state_dict(ckpt['ae'], strict=False)
+            _u(self.ae).load_state_dict(ckpt['ae'], strict=False)
             for p in self.ae.parameters():
                 p.requires_grad_(False)
         if 'optimizer' in ckpt:
