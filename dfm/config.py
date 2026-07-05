@@ -63,6 +63,11 @@ class HFM1DConfig:
     n_ctx_layers: int = 4
     n_ctx_heads: int = 8
 
+    # --- two-phase latent-AE / dynamics (BPTT-free) ---
+    ae_max_delta: int = 6     # AE pair (X_0, X_t): t sampled Uniform{1 .. ae_max_delta}
+    evolve_state: bool = False    # also evolve the anchor-state embedding s_t in latent
+    state_loss_weight: float = 1.0  # weight of the (teacher-forced) state-prediction loss
+
     # --- GAN discriminator ---
     disc_dim: int = 128
     disc_adv_weight: float = 0.02
