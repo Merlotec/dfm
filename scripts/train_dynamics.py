@@ -95,8 +95,12 @@ def main():
 
     val_dl = val_pm = None
     if args.test_data.exists():
+        # num_workers=0 for validation: it first runs at the end of epoch 0, by which
+        # point the parent holds the full latent cache — forking workers against that
+        # bloated (CUDA) process fails with ENOMEM regardless of physical RAM.  Loading
+        # the (small) val set in-process avoids the fork entirely.
         vdm = FVMDataModule(args.test_data, n_context=cfg.n_context_frames, horizon=cfg.horizon_max,
-                            batch_size=batch_size, num_workers=num_workers,
+                            batch_size=batch_size, num_workers=0,
                             cache_frames=cache_frames, random_context=False,
                             mean=dm.mean, std=dm.std)
         vdm.setup()

@@ -90,8 +90,10 @@ def main():
 
     val_dl = val_pm = None
     if args.test_data.exists():
+        # num_workers=0 for validation — avoids forking dataloader workers against the
+        # (large, CUDA-initialised) parent, which fails with ENOMEM under a memory cap.
         vdm = FVMDataModule(args.test_data, n_context=cfg.n_context_frames, horizon=cfg.ae_max_delta,
-                            batch_size=batch_size, num_workers=num_workers,
+                            batch_size=batch_size, num_workers=0,
                             cache_frames=cache_frames, random_context=False,
                             mean=dm.mean, std=dm.std)
         vdm.setup()
