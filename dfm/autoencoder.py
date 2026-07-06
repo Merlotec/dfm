@@ -127,6 +127,8 @@ class LatentAutoencoder(nn.Module):
                 nn.init.zeros_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            if synth.skip_up.bias is not None:      # γ=1, β=0 when film_gen output is 0
+                nn.init.zeros_(synth.skip_up.bias)
         for child in reversed(list(synth.head.children())):
             if isinstance(child, (nn.Linear, nn.Conv2d)):
                 nn.init.zeros_(child.weight)

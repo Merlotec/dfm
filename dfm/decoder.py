@@ -46,10 +46,15 @@ class OverlappingPatchDecoder(nn.Module):
         )
 
         # FiLM skip fusion: the latent patch tokens produce per-location (γ, β) that
-        # gate/scale the skip detail, fused by a 1×1 projection.  No free 3×3 conv → it
-        # can only reshape the existing skip detail, not hallucinate local texture.
+        # gate/scale the skip detail, fused by a 1×1 projection.  No free 3×3 conv on the
+        # image → it can only reshape the existing skip detail, not hallucinate local texture.
         if skip_ch > 0:
             self.film_gen  = nn.Linear(d, 2 * skip_ch)
+            # (γ,β) live at patch resolution → nearest-upsample (repeat) then a depthwise 3×3
+            # to smooth the patch seams.  This "resize-conv" avoids F.interpolate, which
+            # blows up CUDA Inductor's symbolic-shape simplifier during backward codegen.
+            self.skip_up   = nn.Conv2d(2 * skip_ch, 2 * skip_ch, 3, padding=1,
+                                       groups=2 * skip_ch, padding_mode='replicate')
             self.skip_proj = nn.Conv2d(skip_ch, out_channels, 1)
 
         coords = torch.arange(kernel).float() + 0.5
@@ -99,7 +104,8 @@ class OverlappingPatchDecoder(nn.Module):
             skip = skip_feats[0]                                      # [B, skip_ch, H, W]
             gb = self.film_gen(patches.reshape(B, P, d))             # [B, P, 2·skip_ch]
             gb = gb.reshape(B, ph, pw, -1).permute(0, 3, 1, 2)       # [B, 2·skip_ch, ph, pw]
-            gb = F.interpolate(gb, size=output.shape[-2:], mode='bilinear', align_corners=False)
+            gb = gb.repeat_interleave(p, dim=2).repeat_interleave(p, dim=3)   # nearest → H×W
+            gb = self.skip_up(gb)                                    # smooth the patch seams
             gamma, beta = gb[:, :self.skip_ch], gb[:, self.skip_ch:]
             skip_mod = (1.0 + gamma) * skip + beta                   # γ = 1 + γ_raw (identity init)
             output = output + self.skip_proj(skip_mod)
