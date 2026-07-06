@@ -64,7 +64,7 @@
     "l1_weight": 0.1,
     "latent_loss_weight": 0.1,
 
-    "num_workers": 8,
+    "num_workers": 16,
     "cache_frames": false,
     "compile": true
   }
