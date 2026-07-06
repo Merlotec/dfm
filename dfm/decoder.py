@@ -20,23 +20,25 @@ import torch.nn.functional as F
 from typing import List, Optional
 
 from .config import DFMConfig
-from .modules import CrossAttnBlock, SelfAttnBlock, sincos_2d
+from .modules import CrossAttnBlock, SelfAttnBlock, LocalSelfAttnBlock, sincos_2d
 
 
 class OverlappingPatchDecoder(nn.Module):
     """[B, P, P, d] patch tokens → [B, C, H, W] via tent-blended overlapping patches."""
 
-    def __init__(self, d: int, out_channels: int, img_size: int, patch_size: int,
+    def __init__(self, d: int, out_channels: int, img_h: int, img_w: int, patch_size: int,
                  skip_ch: int = 0):
         super().__init__()
         assert patch_size % 4 == 0, "patch_size must be divisible by 4 for 25% overlap"
-        self.img_size     = img_size
+        self.img_h        = img_h
+        self.img_w        = img_w
         self.patch_size   = patch_size
         self.out_channels = out_channels
         self.skip_ch      = skip_ch
-        kernel            = patch_size + patch_size // 2   # 3p/2
+        kernel            = patch_size + patch_size // 2   # 3p/2 (patches stay square)
         self.kernel       = kernel
-        n                 = img_size // patch_size
+        n_h               = img_h // patch_size
+        n_w               = img_w // patch_size
 
         self.head = nn.Sequential(
             nn.LayerNorm(d),
@@ -65,10 +67,10 @@ class OverlappingPatchDecoder(nn.Module):
         self.register_buffer('weight_kernel', wk_2d, persistent=False)
 
         wk_flat  = wk_2d.flatten()
-        norm_in  = wk_flat.unsqueeze(0).unsqueeze(-1).expand(1, -1, n * n)
+        norm_in  = wk_flat.unsqueeze(0).unsqueeze(-1).expand(1, -1, n_h * n_w)
         norm_map = F.fold(
             norm_in.contiguous(),
-            output_size=(img_size, img_size),
+            output_size=(img_h, img_w),
             kernel_size=kernel,
             stride=patch_size,
             padding=patch_size // 4,
@@ -93,7 +95,7 @@ class OverlappingPatchDecoder(nn.Module):
 
         output = F.fold(
             preds.contiguous(),
-            output_size=(self.img_size, self.img_size),
+            output_size=(self.img_h, self.img_w),
             kernel_size=kernel,
             stride=p,
             padding=p // 4,
@@ -113,18 +115,23 @@ class OverlappingPatchDecoder(nn.Module):
 
 
 class _DecoderBlock(nn.Module):
-    """Transformer decoder layer: cross-attend the slots, then self-attend over the patch grid."""
+    """Decoder layer: cross-attend the slots, then local (windowed) self-attention with 2-D
+    RoPE over the patch grid — matching the encoder, so positions are relative (extrapolate
+    across resolutions) and the self-attention is O(N·window) instead of O(N²).  Global
+    coordination still arrives through the slots (every patch reads the same slot set)."""
 
     def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cross     = CrossAttnBlock(cfg.d_model, cfg.d_model, cfg.n_heads,
                                         cfg.mlp_ratio, cfg.dropout)
-        self.self_attn = SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
+        self.self_attn = LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.n_patch_h,
+                                            cfg.n_patch_w, cfg.local_attn_radius,
+                                            cfg.mlp_ratio, cfg.dropout)
 
     def forward(self, q: torch.Tensor, slots: torch.Tensor,
                 key_bias: torch.Tensor | None = None) -> torch.Tensor:
         q = self.cross(q, slots, key_bias=key_bias)   # read the (masked) slot latent
-        q = self.self_attn(q)                          # coordinate patches globally
+        q = self.self_attn(q)                          # coordinate patches locally (RoPE)
         return q
 
 
@@ -136,13 +143,13 @@ class SlotDecoder(nn.Module):
     def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
-        P = cfg.n_patch
+        Ph, Pw = cfg.n_patch_h, cfg.n_patch_w
 
         # A single shared learned query, made position-specific by a
         # resolution-agnostic sin-cos encoding (non-persistent buffer).
         self.query = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
-        self.register_buffer('pos', sincos_2d(P, cfg.d_model).unsqueeze(0),
-                             persistent=False)                   # [1, P², d]
+        self.register_buffer('pos', sincos_2d(Ph, Pw, cfg.d_model).unsqueeze(0),
+                             persistent=False)                   # [1, Ph·Pw, d]
 
         # Learned per-slot rank embedding: gives each slot a stable identity so the
         # decoder knows *which* rank it is reading/attenuating (ordered-slot anchor).
@@ -162,22 +169,23 @@ class SlotDecoder(nn.Module):
         nn.init.trunc_normal_(self.query, std=0.02)
         nn.init.trunc_normal_(self.rank_embed, std=0.02)
 
+        img_h, img_w = cfg.img_hw
         self.synth = OverlappingPatchDecoder(
-            cfg.d_model, cfg.in_channels, cfg.img_size, cfg.patch_px, cfg.skip_ch
+            cfg.d_model, cfg.in_channels, img_h, img_w, cfg.patch_px, cfg.skip_ch
         )
 
     def forward(self, slots: torch.Tensor,
                 skip_feats: Optional[List[torch.Tensor]] = None,
                 key_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         B = slots.shape[0]
-        P = self.cfg.n_patch
+        Ph, Pw = self.cfg.n_patch_h, self.cfg.n_patch_w
 
         slots = slots + self.rank_embed[:, :slots.shape[1]]  # rank tag (sliced if truncated)
         for blk in self.slot_layers:                         # causal slot mixing
             slots = blk(slots, causal=self.slot_causal)
-        q = self.query.expand(B, P * P, -1) + self.pos      # [B, P², d]
+        q = self.query.expand(B, Ph * Pw, -1) + self.pos    # [B, Ph·Pw, d]
         for layer in self.layers:
             q = layer(q, slots, key_bias)                   # cross-attn (masked) → self-attn
-        patch_tokens = q.reshape(B, P, P, self.cfg.d_model)
+        patch_tokens = q.reshape(B, Ph, Pw, self.cfg.d_model)
 
         return self.synth(patch_tokens, skip_feats)

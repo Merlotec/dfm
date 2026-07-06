@@ -72,8 +72,8 @@ def main():
     # ---- data ----
     stats_dir = Path(args.stats_dir) if args.stats_dir else data_dir
     mean, std = load_stats(stats_dir)
-    renderer   = build_renderer(data_dir, (cfg.img_size, cfg.img_size), device='cpu')
-    pixel_mask = load_pixel_mask(data_dir, renderer, (cfg.img_size, cfg.img_size)).to(device)
+    renderer   = build_renderer(data_dir, cfg.img_hw, device='cpu')
+    pixel_mask = load_pixel_mask(data_dir, renderer, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
     sim_dirs = find_sim_dirs(data_dir)
     if not sim_dirs:
         raise RuntimeError(f'No simulation subdirectories found in {data_dir}')
@@ -95,8 +95,9 @@ def main():
 
         start = args.seq_start if args.seq_start is not None else len(ds) // 2
         ctx_seq, pred_seq = ds[start]
-        context_frames = [ctx_seq[t:t+1].to(device) * pixel_mask for t in range(n_context)]
-        pred_gt        = [pred_seq[t:t+1].to(device) * pixel_mask for t in range(pred_len)]
+        valid = pixel_mask[:, :1]                                   # is_valid (fluid) channel
+        context_frames = [ctx_seq[t:t+1].to(device) * valid for t in range(n_context)]
+        pred_gt        = [pred_seq[t:t+1].to(device) * valid for t in range(pred_len)]
         pred_ts        = [float(ds.paths[start + t].stem[2:]) for t in range(pred_len)]
         x0 = pred_gt[0]
 
@@ -116,13 +117,13 @@ def main():
         gt_arr    = torch.cat(gt,    dim=0).numpy()
         pred_arr  = torch.cat(preds, dim=0).numpy()
         gt_phys   = denorm(gt_arr,   mean, std)
-        pred_phys = denorm(pred_arr, mean, std) * pixel_mask.cpu().numpy()
+        pred_phys = denorm(pred_arr, mean, std) * pixel_mask[:, :1].cpu().numpy()
         np.save(run_out / 'frames_gt.npy',        gt_arr)
         np.save(run_out / 'frames_pred.npy',      pred_arr)
         np.save(run_out / 'frames_gt_phys.npy',   gt_phys)
         np.save(run_out / 'frames_pred_phys.npy', pred_phys)
 
-        seed_phys = denorm(pred_gt[0].cpu().numpy(), mean, std) * pixel_mask.cpu().numpy()
+        seed_phys = denorm(pred_gt[0].cpu().numpy(), mean, std) * pixel_mask[:, :1].cpu().numpy()
         save_viewer_frames(seed_phys, pred_phys, pred_ts, n_context=1,
                            run_name=sim_dir.name, viewer_dir=out_dir / 'viewer')
         if not args.no_images:

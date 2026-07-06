@@ -85,8 +85,8 @@ def main():
     assert dm._dataset is not None
     steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
     total_steps     = steps_per_epoch * n_epochs
-    renderer   = build_renderer(args.data, (cfg.img_size, cfg.img_size))
-    pixel_mask = load_pixel_mask(args.data, renderer, (cfg.img_size, cfg.img_size)).to(device)
+    renderer   = build_renderer(args.data, cfg.img_hw)
+    pixel_mask = load_pixel_mask(args.data, renderer, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
 
     val_dl = val_pm = None
     if args.test_data.exists():
@@ -97,8 +97,8 @@ def main():
                             cache_frames=cache_frames, random_context=False,
                             mean=dm.mean, std=dm.std)
         vdm.setup()
-        vr = build_renderer(args.test_data, (cfg.img_size, cfg.img_size))
-        val_pm = load_pixel_mask(args.test_data, vr, (cfg.img_size, cfg.img_size)).to(device)
+        vr = build_renderer(args.test_data, cfg.img_hw)
+        val_pm = load_pixel_mask(args.test_data, vr, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
         val_dl = vdm.val_dataloader()
 
     trainer = AutoencoderTrainer(

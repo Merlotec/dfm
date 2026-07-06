@@ -33,8 +33,8 @@ def _scaled_dot(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 # 2-D rotary position embedding
 # ---------------------------------------------------------------------------
 
-def build_2d_rope(P: int, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """cos/sin tables of shape [P*P, head_dim] for a P×P grid.
+def build_2d_rope(grid_h: int, grid_w: int, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin tables of shape [grid_h*grid_w, head_dim] for a grid_h×grid_w grid.
 
     The head dim is split in four: the first half encodes the row coordinate,
     the second half the column coordinate (each duplicated for the rotate-half
@@ -43,9 +43,9 @@ def build_2d_rope(P: int, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     assert head_dim % 4 == 0, "head_dim must be divisible by 4 for 2-D RoPE"
     quarter = head_dim // 4
     theta   = 1.0 / (10000 ** (torch.arange(quarter, dtype=torch.float) / quarter))
-    rows    = torch.arange(P).repeat_interleave(P).float()   # [P²]
-    cols    = torch.arange(P).repeat(P).float()              # [P²]
-    rf      = torch.outer(rows, theta)                       # [P², quarter]
+    rows    = torch.arange(grid_h).repeat_interleave(grid_w).float()   # [grid_h·grid_w]
+    cols    = torch.arange(grid_w).repeat(grid_h).float()             # [grid_h·grid_w]
+    rf      = torch.outer(rows, theta)                       # [N, quarter]
     cf      = torch.outer(cols, theta)
     half_c  = torch.cat([rf.cos(), cf.cos()], dim=-1)        # [P², hd/2]
     half_s  = torch.cat([rf.sin(), cf.sin()], dim=-1)
@@ -74,16 +74,17 @@ class LocalSelfAttention2D(nn.Module):
     are gathered by padding+shifting the grid, so the attention is over
     (2r+1)² keys per query instead of all P² — O(N·9) rather than O(N²).
 
-    Input / output: [B, P*P, dim]  (row-major flattening of the grid).
+    Input / output: [B, grid_h*grid_w, dim]  (row-major flattening of the grid).
     """
 
-    def __init__(self, dim: int, n_heads: int, grid: int, radius: int = 1,
+    def __init__(self, dim: int, n_heads: int, grid_h: int, grid_w: int, radius: int = 1,
                  dropout: float = 0.0):
         super().__init__()
         assert dim % n_heads == 0
         self.n_heads  = n_heads
         self.head_dim = dim // n_heads
-        self.P        = grid
+        self.H        = grid_h
+        self.W        = grid_w
         self.radius   = radius
         self.win      = 2 * radius + 1
 
@@ -94,9 +95,9 @@ class LocalSelfAttention2D(nn.Module):
         self.drop     = nn.Dropout(dropout)
 
         # RoPE tables for centre queries and for gathered neighbour keys
-        cos, sin = build_2d_rope(grid, self.head_dim)        # [N, hd]
-        cos_grid = cos.reshape(grid, grid, self.head_dim)
-        sin_grid = sin.reshape(grid, grid, self.head_dim)
+        cos, sin = build_2d_rope(grid_h, grid_w, self.head_dim)   # [N, hd]
+        cos_grid = cos.reshape(grid_h, grid_w, self.head_dim)
+        sin_grid = sin.reshape(grid_h, grid_w, self.head_dim)
         # Deterministic, resolution-shaped → non-persistent (rebuilt at construction,
         # never stored in the checkpoint, so weights transfer across resolutions).
         self.register_buffer('cos_c', cos, persistent=False)                   # [N, hd]
@@ -104,7 +105,7 @@ class LocalSelfAttention2D(nn.Module):
         self.register_buffer('cos_n', self._gather_grid(cos_grid), persistent=False)  # [N, W, hd]
         self.register_buffer('sin_n', self._gather_grid(sin_grid), persistent=False)
         # validity mask: which of the W neighbours are inside the grid
-        ones = torch.ones(grid, grid, 1)
+        ones = torch.ones(grid_h, grid_w, 1)
         mask = self._gather_grid(ones).squeeze(-1) > 0.5     # [N, W]
         self.register_buffer('nbr_mask', mask, persistent=False)
 
@@ -115,25 +116,25 @@ class LocalSelfAttention2D(nn.Module):
     nbr_mask: torch.Tensor
 
     def _gather_grid(self, grid: torch.Tensor) -> torch.Tensor:
-        """[P, P, X] → [P*P, win*win, X] of neighbourhood values (zero-padded)."""
-        P, r, win = self.P, self.radius, self.win
+        """[H, W, X] → [H*W, win*win, X] of neighbourhood values (zero-padded)."""
+        H, W, r, win = self.H, self.W, self.radius, self.win
         X = grid.shape[-1]
-        g = grid.permute(2, 0, 1).unsqueeze(0)               # [1, X, P, P]
+        g = grid.permute(2, 0, 1).unsqueeze(0)               # [1, X, H, W]
         g = F.pad(g, (r, r, r, r))
-        cols = [g[:, :, di:di + P, dj:dj + P]
+        cols = [g[:, :, di:di + H, dj:dj + W]
                 for di in range(win) for dj in range(win)]
-        nb = torch.stack(cols, dim=2)                        # [1, X, W, P, P]
-        return nb.permute(0, 3, 4, 2, 1).reshape(P * P, win * win, X)
+        nb = torch.stack(cols, dim=2)                        # [1, X, win², H, W]
+        return nb.permute(0, 3, 4, 2, 1).reshape(H * W, win * win, X)
 
     def _gather_batch(self, t: torch.Tensor) -> torch.Tensor:
         """[B, N, C] → [B, N, win*win, C] of neighbourhood features."""
         B, N, C = t.shape
-        P, r, win = self.P, self.radius, self.win
-        g = t.reshape(B, P, P, C).permute(0, 3, 1, 2)        # [B, C, P, P]
+        H, W, r, win = self.H, self.W, self.radius, self.win
+        g = t.reshape(B, H, W, C).permute(0, 3, 1, 2)        # [B, C, H, W]
         g = F.pad(g, (r, r, r, r))
-        cols = [g[:, :, di:di + P, dj:dj + P]
+        cols = [g[:, :, di:di + H, dj:dj + W]
                 for di in range(win) for dj in range(win)]
-        nb = torch.stack(cols, dim=2)                        # [B, C, W, P, P]
+        nb = torch.stack(cols, dim=2)                        # [B, C, win², H, W]
         return nb.permute(0, 3, 4, 2, 1).reshape(B, N, win * win, C)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

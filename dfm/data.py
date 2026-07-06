@@ -19,6 +19,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 # ---- inject solver path so MeshRenderer is importable ----
@@ -98,6 +99,19 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int],
 # Pixel mask (fluid vs. hole)
 # ---------------------------------------------------------------------------
 
+def pad_to_multiple(x: torch.Tensor, m: int, value: float = 0.0) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Pad the last two dims of x up to a multiple of `m` (bottom/right).
+
+    Returns (padded, (H_orig, W_orig)) — the original size is what tells you where the
+    pad begins (everything at row >= H_orig or col >= W_orig is padding / outside frame).
+    """
+    H, W = x.shape[-2], x.shape[-1]
+    ph, pw = (-H) % m, (-W) % m
+    if ph or pw:
+        x = F.pad(x, (0, pw, 0, ph), value=value)
+    return x, (H, W)
+
+
 def build_pixel_mask(renderer: MeshRenderer, resolution: tuple[int, int]) -> torch.Tensor:
     """Boolean (1, 1, H, W) mask — True for pixels inside the fluid mesh."""
     H, W = resolution
@@ -107,23 +121,43 @@ def build_pixel_mask(renderer: MeshRenderer, resolution: tuple[int, int]) -> tor
 
 
 def load_pixel_mask(dataset_dir: Path, renderer: MeshRenderer,
-                    resolution: tuple[int, int]) -> torch.Tensor:
-    """Return cached pixel mask, building and saving it if not yet cached."""
+                    resolution: tuple[int, int], frame_mask: bool = False,
+                    native_hw: Optional[tuple[int, int]] = None) -> torch.Tensor:
+    """Return the cached is_valid pixel mask (1, 1, H, W).
+
+    When ``frame_mask`` is set, return a 2-channel (1, 2, H, W) mask
+    ``[is_valid, is_inside_frame]``: is_valid is True on fluid pixels only, and
+    is_inside_frame is False on the pad border (rows >= native_hw[0] or cols >=
+    native_hw[1]) so the model can tell padding apart from colliders.  If native_hw
+    is None the frame is assumed to fill the grid (is_inside_frame all True).
+    """
     H, W = resolution
     cache = dataset_dir / f'pixel_mask_{H}x{W}.pt'
     n_interior = len(renderer._interior_idx)
     if cache.exists():
-        m = torch.load(cache, weights_only=True)
-        if (m.shape == (1, 1, H, W)
-                and int(m.sum()) == n_interior
-                and m.view(-1)[renderer._interior_idx].all()):
-            return m
-        print('  Pixel mask stale (renderer mismatch), rebuilding...')
-        cache.unlink()
-    mask = build_pixel_mask(renderer, resolution)
-    torch.save(mask, cache)
-    print(f'  Pixel mask saved — {mask.sum().item()} fluid / {mask.numel()} total pixels')
-    return mask
+        valid = torch.load(cache, weights_only=True)
+        if not (valid.shape == (1, 1, H, W)
+                and int(valid.sum()) == n_interior
+                and valid.view(-1)[renderer._interior_idx].all()):
+            print('  Pixel mask stale (renderer mismatch), rebuilding...')
+            cache.unlink()
+            valid = None
+    else:
+        valid = None
+    if valid is None:
+        valid = build_pixel_mask(renderer, resolution)
+        torch.save(valid, cache)
+        print(f'  Pixel mask saved — {valid.sum().item()} fluid / {valid.numel()} total pixels')
+
+    if not frame_mask:
+        return valid
+    inside = torch.ones_like(valid)
+    if native_hw is not None:
+        h0, w0 = native_hw
+        inside[..., h0:, :] = False
+        inside[..., :, w0:] = False
+        valid = valid & inside                         # fluid can't be in the pad region
+    return torch.cat([valid, inside], dim=1)           # [1, 2, H, W]
 
 
 # ---------------------------------------------------------------------------

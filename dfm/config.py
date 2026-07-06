@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -14,9 +15,14 @@ class DFMConfig:
     """
 
     # --- image / patch ---
-    img_size: int = 256
+    img_size: int = 256           # image height (H); also the width when img_w is None (square)
+    img_w: Optional[int] = None   # image width (W); None → square (W = img_size)
     in_channels: int = 4
     patch_px: int = 16
+    # frame_mask: pad non-divisible frames up to a patch multiple and feed the encoders a
+    # 2-channel mask [is_valid, is_inside_frame] so the model tells fluid / collider / pad
+    # apart (a collider is a solid wall; the pad is beyond the simulated frame).
+    frame_mask: bool = False
 
     # --- token / slot dimensions ---
     d_model: int = 256        # patch + slot token dim
@@ -105,5 +111,21 @@ class DFMConfig:
     gradient_checkpointing: bool = False
 
     @property
-    def n_patch(self) -> int:
+    def img_hw(self) -> tuple[int, int]:
+        return (self.img_size, self.img_w or self.img_size)
+
+    @property
+    def n_mask_ch(self) -> int:    # mask channels fed to the encoders (valid [+ inside-frame])
+        return 2 if self.frame_mask else 1
+
+    @property
+    def n_patch_h(self) -> int:
         return self.img_size // self.patch_px
+
+    @property
+    def n_patch_w(self) -> int:
+        return (self.img_w or self.img_size) // self.patch_px
+
+    @property
+    def n_patch(self) -> int:      # square back-compat; == n_patch_h
+        return self.n_patch_h

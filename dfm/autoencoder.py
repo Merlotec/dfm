@@ -45,14 +45,14 @@ class PairEncoder(nn.Module):
     def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
-        P = cfg.n_patch
+        Ph, Pw = cfg.n_patch_h, cfg.n_patch_w
 
-        # patch-embed [X_0 ; X_t ; mask]  →  2·C + 1 input channels
-        self.patch_embed = PatchEmbed(2 * cfg.in_channels + 1, cfg.patch_px, cfg.d_model)
-        self.register_buffer('pos', sincos_2d(P, cfg.d_model).unsqueeze(0), persistent=False)
+        # patch-embed [X_0 ; X_t ; mask(s)]  →  2·C + n_mask_ch input channels
+        self.patch_embed = PatchEmbed(2 * cfg.in_channels + cfg.n_mask_ch, cfg.patch_px, cfg.d_model)
+        self.register_buffer('pos', sincos_2d(Ph, Pw, cfg.d_model).unsqueeze(0), persistent=False)
 
         self.layers = nn.ModuleList([
-            LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, P, cfg.local_attn_radius,
+            LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, Ph, Pw, cfg.local_attn_radius,
                                cfg.mlp_ratio, cfg.dropout)
             for _ in range(cfg.n_enc_layers)
         ])
@@ -70,14 +70,16 @@ class PairEncoder(nn.Module):
     def forward(self, x0: torch.Tensor, xt: torch.Tensor,
                 pixel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, _, H, W = x0.shape
+        nmc = self.cfg.n_mask_ch
         if pixel_mask is not None:
-            x0 = x0 * pixel_mask
-            xt = xt * pixel_mask
-            mask_ch = pixel_mask.float().expand(B, 1, H, W)
+            valid = pixel_mask[:, :1].float()                        # is_valid (fluid) channel
+            x0 = x0 * valid
+            xt = xt * valid
+            mask_ch = pixel_mask.float().expand(B, nmc, H, W)        # [is_valid(, is_inside_frame)]
         else:
-            mask_ch = torch.ones(B, 1, H, W, device=x0.device, dtype=x0.dtype)
+            mask_ch = torch.ones(B, nmc, H, W, device=x0.device, dtype=x0.dtype)
 
-        x   = torch.cat([x0, xt, mask_ch], dim=1)                    # [B, 2C+1, H, W]
+        x   = torch.cat([x0, xt, mask_ch], dim=1)                    # [B, 2C+nmc, H, W]
         tok = rearrange(self.patch_embed(x), 'b h w d -> b (h w) d') + self.pos
         for layer in self.layers:
             tok = layer(tok)
@@ -143,7 +145,7 @@ class LatentAutoencoder(nn.Module):
     def decode(self, x0: torch.Tensor, latent: torch.Tensor,
                pixel_mask: Optional[torch.Tensor] = None,
                slot_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
-        skip = self.skip_encoder(x0 * pixel_mask if pixel_mask is not None else x0)
+        skip = self.skip_encoder(x0 * pixel_mask[:, :1] if pixel_mask is not None else x0)
         key_bias = slot_log_bias(slot_weights) if slot_weights is not None else None
         return self.decoder(latent, skip, key_bias)
 
@@ -224,7 +226,7 @@ class AutoencoderTrainer:
 
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
             xhat, _ = self.ae(x0, xt, pixel_mask, slot_weights)
-        xhat_masked = xhat.float() * pixel_mask if pixel_mask is not None else xhat.float()
+        xhat_masked = xhat.float() * pixel_mask[:, :1] if pixel_mask is not None else xhat.float()
 
         # discriminator conditions on the anchor X_0 only (constant zero context)
         zero_ctx = torch.zeros(x0.shape[0], 1, self.cfg.d_ctx, device=x0.device)

@@ -59,12 +59,13 @@ class LatentDynamics(nn.Module):
                          pixel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Full-state tokens s = encode(frame)  [B, n_slots, d_model]."""
         B, _, H, W = x.shape
+        nmc = self.cfg.n_mask_ch
         if pixel_mask is not None:
-            xm = x * pixel_mask
-            mask_ch = pixel_mask.float().expand(B, 1, H, W)
+            xm = x * pixel_mask[:, :1]                              # is_valid (fluid) channel
+            mask_ch = pixel_mask.float().expand(B, nmc, H, W)       # [is_valid(, is_inside_frame)]
         else:
             xm = x
-            mask_ch = torch.ones(B, 1, H, W, device=x.device, dtype=x.dtype)
+            mask_ch = torch.ones(B, nmc, H, W, device=x.device, dtype=x.dtype)
         return self.state_encoder(torch.cat([xm, mask_ch], dim=1))
 
     def project_state(self, s_raw: torch.Tensor) -> torch.Tensor:
@@ -308,7 +309,7 @@ class LatentDynamicsTrainer:
             latent = self.dynamics(latent, context, state, i)          # operator over N slots
             pred   = self.ae.decode(anchor, latent, pixel_mask)        # decode from N slots
             if pixel_mask is not None:
-                pred = pred * pixel_mask
+                pred = pred * pixel_mask[:, :1]
             preds.append(pred)
             if reencode_every > 0 and (i + 1) % reencode_every == 0 and i + 1 < n_steps:
                 # decode-based re-anchor: refreshes detail, delta budget, and re-syncs s

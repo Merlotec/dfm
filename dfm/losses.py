@@ -21,6 +21,7 @@ class FluidLoss(nn.Module):
         if self.pixel_mask is None:
             d = pred - target
         else:
-            mask = self.pixel_mask.expand_as(pred).bool()
+            # first channel is is_valid (fluid); supervise those pixels only
+            mask = self.pixel_mask[:, :1].expand_as(pred).bool()
             d = pred[mask] - target[mask]
         return d.pow(2).mean() + self.l1_weight * d.abs().mean()

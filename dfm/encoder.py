@@ -26,16 +26,16 @@ class FrameEncoder(nn.Module):
     def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
-        P = cfg.n_patch
+        Ph, Pw = cfg.n_patch_h, cfg.n_patch_w
 
-        # +1 input channel for the geometry mask
-        self.patch_embed = PatchEmbed(cfg.in_channels + 1, cfg.patch_px, cfg.d_model)
+        # +n_mask_ch input channels for the geometry mask(s)
+        self.patch_embed = PatchEmbed(cfg.in_channels + cfg.n_mask_ch, cfg.patch_px, cfg.d_model)
         # Resolution-agnostic sin-cos absolute position (non-persistent buffer)
-        self.register_buffer('pos', sincos_2d(P, cfg.d_model).unsqueeze(0),
-                             persistent=False)                  # [1, P², d]
+        self.register_buffer('pos', sincos_2d(Ph, Pw, cfg.d_model).unsqueeze(0),
+                             persistent=False)                  # [1, Ph·Pw, d]
 
         self.layers = nn.ModuleList([
-            LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, P, cfg.local_attn_radius,
+            LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, Ph, Pw, cfg.local_attn_radius,
                                cfg.mlp_ratio, cfg.dropout)
             for _ in range(cfg.n_enc_layers)
         ])
