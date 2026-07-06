@@ -162,8 +162,11 @@ def main():
         lsum, lcnt = 0.0, 0
         for idx_b, context_b, pred_b in train_dl:
             prof.data_ready()
-            context_frames = [context_b[:, t].to(device) for t in range(context_b.shape[1])]
-            pred_frames    = [pred_b[:, t].to(device)    for t in range(pred_b.shape[1])]
+            # one H2D copy per tensor (pinned → non-blocking), then slice into GPU views
+            context_b = context_b.to(device, non_blocking=True)
+            pred_b    = pred_b.to(device, non_blocking=True)
+            context_frames = [context_b[:, t] for t in range(context_b.shape[1])]
+            pred_frames    = [pred_b[:, t]    for t in range(pred_b.shape[1])]
             loss = trainer.step(context_frames, pred_frames, pixel_mask=pixel_mask, index=idx_b)
             prof.step_done(pred_b.shape[0])
             step = trainer.global_step

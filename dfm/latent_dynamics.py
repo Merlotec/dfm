@@ -73,12 +73,12 @@ class LatentDynamics(nn.Module):
         return self.state_proj(self.encode_state_raw(x, pixel_mask))
 
     def evolve_state(self, s_raw: torch.Tensor, context: torch.Tensor,
-                     step_idx: int) -> torch.Tensor:
-        """s_t → s_{t+1} in latent (raw d_model space)."""
+                     step_idx) -> torch.Tensor:
+        """s_t → s_{t+1} in latent (raw d_model space).  step_idx: int or [B] tensor."""
         return self.state_dynamics(s_raw, context, step_idx)
 
     def forward(self, latent: torch.Tensor, context: torch.Tensor,
-                state: torch.Tensor, step_idx: int) -> torch.Tensor:
+                state: torch.Tensor, step_idx) -> torch.Tensor:
         combined = torch.cat([context, state], dim=1)   # [B, K + n_slots, d_ctx]
         return self.operator(latent, combined, step_idx)
 
@@ -190,28 +190,34 @@ class LatentDynamicsTrainer:
 
             # denoising regularizer: feed a noised L_t but supervise against the clean
             # L_{t+1}, so the operator learns to correct off-manifold drift at rollout.
-            ns = self.cfg.latent_noise_std
+            #
+            # The n teacher-forced steps are independent (every input is a precomputed
+            # target), so they run as ONE batched operator call with the timestep folded
+            # into the batch dim (t-major: rows are [t0·B, t1·B, ...]).  This replaces the
+            # per-step Python loop's n kernel launches with a single large one.
+            ns    = self.cfg.latent_noise_std
+            B     = x0.shape[0]
+            steps = torch.arange(n, device=x0.device).repeat_interleave(B)     # [n·B]
+            L_in  = add_relative_noise(torch.cat(latents[:n], dim=0), ns)       # noised L_0..L_{n-1}
+            L_tgt = torch.cat(latents[1:n + 1], dim=0)                          # clean  L_1..L_n
+            ctx_rep = context.repeat(n, 1, 1)                                   # same context per step
 
             if self.cfg.evolve_state:
                 # per-step full-state encodings (with grad → trains the encoder via the
                 # delta path); detached copies are the teacher targets for state evolution.
                 s_raw  = [self.dynamics.encode_state_raw(f, pixel_mask) for f in pred_frames]
-                s_proj = [self.dynamics.project_state(s) for s in s_raw]
-                delta_loss = torch.zeros((), device=x0.device)
-                state_loss = torch.zeros((), device=x0.device)
-                for t in range(n):
-                    dp = self.dynamics(add_relative_noise(latents[t], ns), context, s_proj[t], t)
-                    delta_loss = delta_loss + F.mse_loss(dp.float(), latents[t + 1].float())
-                    sp = self.dynamics.evolve_state(s_raw[t].detach(), context, t)  # s_t → s_{t+1}
-                    state_loss = state_loss + F.mse_loss(sp.float(), s_raw[t + 1].detach().float())
-                loss = (delta_loss + self.cfg.state_loss_weight * state_loss) / max(1, n)
+                s_proj = torch.cat([self.dynamics.project_state(s) for s in s_raw[:n]], dim=0)
+                dp = self.dynamics(L_in, ctx_rep, s_proj, steps)               # L_t → L_{t+1}
+                delta_loss = F.mse_loss(dp.float(), L_tgt.float())
+                s_in  = torch.cat([s.detach() for s in s_raw[:n]],     dim=0)
+                s_tgt = torch.cat([s.detach() for s in s_raw[1:n + 1]], dim=0)
+                sp = self.dynamics.evolve_state(s_in, ctx_rep, steps)          # s_t → s_{t+1}
+                state_loss = F.mse_loss(sp.float(), s_tgt.float())
+                loss = delta_loss + self.cfg.state_loss_weight * state_loss
             else:
-                state = self.dynamics.encode_state(x0, pixel_mask)   # fixed anchor s_0
-                loss = torch.zeros((), device=x0.device)
-                for t in range(n):
-                    pred = self.dynamics(add_relative_noise(latents[t], ns), context, state, t)
-                    loss = loss + F.mse_loss(pred.float(), latents[t + 1].float())
-                loss = loss / max(1, n)
+                state = self.dynamics.encode_state(x0, pixel_mask)             # fixed anchor s_0
+                pred  = self.dynamics(L_in, ctx_rep, state.repeat(n, 1, 1), steps)
+                loss  = F.mse_loss(pred.float(), L_tgt.float())
 
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()

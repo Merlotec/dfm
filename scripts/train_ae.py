@@ -153,8 +153,8 @@ def main():
             prof.data_ready()
             npred = pred_b.shape[1] - 1                        # frames after X_0
             t = int(torch.randint(1, npred + 1, (1,)).item()) # Δt ~ Uniform{1..npred}
-            x0 = pred_b[:, 0].to(device)
-            xt = pred_b[:, t].to(device)
+            x0 = pred_b[:, 0].to(device, non_blocking=True)
+            xt = pred_b[:, t].to(device, non_blocking=True)
             recon, disc = trainer.step(x0, xt, pixel_mask=pixel_mask)
             prof.step_done(pred_b.shape[0])
             step = trainer.global_step

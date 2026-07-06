@@ -65,14 +65,21 @@ class EvolutionOperator(nn.Module):
         # Learnable latent step size, initialised to dt = 1.
         self.log_dt = nn.Parameter(torch.zeros(()))
 
-    def _f(self, slots: torch.Tensor, context: torch.Tensor,
-           step_idx: int) -> torch.Tensor:
-        idx = torch.tensor(min(step_idx, self.cfg.max_rollout - 1), device=slots.device)
-        return self.tendency(slots + self.step_emb(idx), context)
+    def _f(self, slots: torch.Tensor, context: torch.Tensor, step_idx) -> torch.Tensor:
+        cap = self.cfg.max_rollout - 1
+        if torch.is_tensor(step_idx):
+            # per-example step indices [B] → per-example embedding [B, 1, d]
+            emb = self.step_emb(step_idx.clamp(max=cap)).unsqueeze(1)
+        else:
+            emb = self.step_emb(torch.tensor(min(step_idx, cap), device=slots.device))
+        return self.tendency(slots + emb, context)
 
     def forward(self, slots: torch.Tensor, context: torch.Tensor,
-                step_idx: int) -> torch.Tensor:
-        """Advance slots by one latent step.  slots: [B, n_slots, d_model]."""
+                step_idx) -> torch.Tensor:
+        """Advance slots by one latent step.  slots: [B, n_slots, d_model].
+
+        `step_idx` may be a Python int (single step, e.g. rollout) or a [B] tensor
+        of per-example indices (batched teacher-forced steps)."""
         dt = torch.exp(self.log_dt)
 
         if self.cfg.integrator == 'euler':

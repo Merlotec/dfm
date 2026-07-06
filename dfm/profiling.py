@@ -18,6 +18,27 @@ from pathlib import Path
 import torch
 
 
+def _host_mem() -> str:
+    """Process RSS + host available RAM + swap used, from /proc (Linux only).
+
+    Reveals the classic 'GPU idle, throughput falling each epoch' cause: the host
+    filling up and swapping (avail → 0, swap climbing).
+    """
+    try:
+        with open('/proc/self/statm') as f:
+            rss_gb = int(f.read().split()[1]) * 4096 / 1e9      # resident pages × page size
+        info = {}
+        with open('/proc/meminfo') as f:
+            for ln in f:
+                k, _, rest = ln.partition(':')
+                info[k] = float(rest.strip().split()[0]) / 1e6  # kB → GB
+        avail = info.get('MemAvailable', 0.0)
+        swap  = info.get('SwapTotal', 0.0) - info.get('SwapFree', 0.0)
+        return f'  ram={rss_gb:.1f}GB avail={avail:.0f}GB swap={swap:.1f}GB'
+    except Exception:
+        return ''
+
+
 class LoopProfiler:
     """
     Measures throughput over each log interval with a *single* CUDA sync (in
@@ -69,7 +90,7 @@ class LoopProfiler:
             except Exception:
                 pass
             torch.cuda.reset_peak_memory_stats()
-        s = f'{its:.2f} it/s  {sps:.0f} samp/s  data-wait={data_pct:.0f}%{extra}'
+        s = f'{its:.2f} it/s  {sps:.0f} samp/s  data-wait={data_pct:.0f}%{extra}{_host_mem()}'
         self._reset()
         now = time.perf_counter()
         self._t = now

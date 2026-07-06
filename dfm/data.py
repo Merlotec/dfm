@@ -390,6 +390,7 @@ class FVMDataModule:
             num_workers        = w,
             pin_memory         = True,
             persistent_workers = w > 0,
+            drop_last          = True,   # constant batch shape → no last-batch recompile
         )
 
     def val_dataloader(self) -> DataLoader:
