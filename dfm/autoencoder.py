@@ -53,15 +53,15 @@ class PairEncoder(nn.Module):
 
         self.layers = nn.ModuleList([
             LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, Ph, Pw, cfg.local_attn_radius,
-                               cfg.mlp_ratio, cfg.dropout)
+                               cfg.ae_mlp, cfg.dropout)
             for _ in range(cfg.n_enc_layers)
         ])
         self.slots      = nn.Parameter(torch.zeros(1, cfg.n_slots, cfg.d_model))
         self.slot_cross = CrossAttnBlock(cfg.d_model, cfg.d_model, cfg.n_heads,
-                                         cfg.mlp_ratio, cfg.dropout)
+                                         cfg.ae_mlp, cfg.dropout)
         # slot self-attention (causal over the priority axis → prefix-invariant)
         self.slot_layers  = nn.ModuleList([
-            SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
+            SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.ae_mlp, cfg.dropout)
             for _ in range(cfg.n_slot_layers)
         ])
         self.slot_causal = cfg.slot_hierarchy

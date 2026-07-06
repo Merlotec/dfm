@@ -10,7 +10,7 @@
     "n_slots": 128,
     "n_heads": 8,
 
-    "n_enc_layers": 4,
+    "n_enc_layers": 3,
     "local_attn_radius": 1,
 
     "n_evo_layers": 4,
@@ -20,7 +20,7 @@
     "reencode_every_min": 1,
     "reencode_every_max": 5,
 
-    "n_dec_layers": 4,
+    "n_dec_layers": 3,
     "skip_ch": 32,
 
     "slot_hierarchy": true,
@@ -39,6 +39,7 @@
     "horizon_gamma": 1.0,
 
     "mlp_ratio": 4.0,
+    "ae_mlp_ratio": 2.0,
     "dropout": 0.0,
 
     "n_context_frames": 5,

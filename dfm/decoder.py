@@ -123,10 +123,10 @@ class _DecoderBlock(nn.Module):
     def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cross     = CrossAttnBlock(cfg.d_model, cfg.d_model, cfg.n_heads,
-                                        cfg.mlp_ratio, cfg.dropout)
+                                        cfg.ae_mlp, cfg.dropout)
         self.self_attn = LocalSelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.n_patch_h,
                                             cfg.n_patch_w, cfg.local_attn_radius,
-                                            cfg.mlp_ratio, cfg.dropout)
+                                            cfg.ae_mlp, cfg.dropout)
 
     def forward(self, q: torch.Tensor, slots: torch.Tensor,
                 key_bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -158,7 +158,7 @@ class SlotDecoder(nn.Module):
         # slot self-attention (causal over the priority axis → prefix-invariant), applied
         # to the latent before the patch queries read it.
         self.slot_layers = nn.ModuleList([
-            SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
+            SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.ae_mlp, cfg.dropout)
             for _ in range(cfg.n_slot_layers)
         ])
         self.slot_causal = cfg.slot_hierarchy

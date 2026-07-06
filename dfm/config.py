@@ -64,6 +64,7 @@ class DFMConfig:
 
     # --- transformer ---
     mlp_ratio: float = 4.0
+    ae_mlp_ratio: Optional[float] = None   # FFN width for the AE (encoder+decoder); None → mlp_ratio
     dropout: float = 0.0
 
     # --- context encoder (history → conditioning) ---
@@ -117,6 +118,10 @@ class DFMConfig:
     @property
     def n_mask_ch(self) -> int:    # mask channels fed to the encoders (valid [+ inside-frame])
         return 2 if self.frame_mask else 1
+
+    @property
+    def ae_mlp(self) -> float:     # resolved AE FFN width (falls back to mlp_ratio)
+        return self.ae_mlp_ratio if self.ae_mlp_ratio is not None else self.mlp_ratio
 
     @property
     def n_patch_h(self) -> int:
