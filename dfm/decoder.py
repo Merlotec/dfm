@@ -45,12 +45,12 @@ class OverlappingPatchDecoder(nn.Module):
             nn.Linear(d, out_channels * kernel * kernel),
         )
 
-        mid = max(out_channels * 8, 64)
-        self.post_conv = nn.Sequential(
-            nn.Conv2d(out_channels + skip_ch, mid, 3, padding=1, padding_mode='replicate'),
-            nn.GELU(),
-            nn.Conv2d(mid, out_channels, 3, padding=1, padding_mode='replicate'),
-        )
+        # FiLM skip fusion: the latent patch tokens produce per-location (γ, β) that
+        # gate/scale the skip detail, fused by a 1×1 projection.  No free 3×3 conv → it
+        # can only reshape the existing skip detail, not hallucinate local texture.
+        if skip_ch > 0:
+            self.film_gen  = nn.Linear(d, 2 * skip_ch)
+            self.skip_proj = nn.Conv2d(skip_ch, out_channels, 1)
 
         coords = torch.arange(kernel).float() + 0.5
         centre = kernel / 2.0
@@ -95,12 +95,15 @@ class OverlappingPatchDecoder(nn.Module):
         )
         output = output / self.norm_map.clamp(min=1e-6)
 
-        post_in = (
-            torch.cat([output, skip_feats[0]], dim=1)
-            if self.skip_ch > 0 and skip_feats
-            else output
-        )
-        return output + self.post_conv(post_in)
+        if self.skip_ch > 0 and skip_feats:
+            skip = skip_feats[0]                                      # [B, skip_ch, H, W]
+            gb = self.film_gen(patches.reshape(B, P, d))             # [B, P, 2·skip_ch]
+            gb = gb.reshape(B, ph, pw, -1).permute(0, 3, 1, 2)       # [B, 2·skip_ch, ph, pw]
+            gb = F.interpolate(gb, size=output.shape[-2:], mode='bilinear', align_corners=False)
+            gamma, beta = gb[:, :self.skip_ch], gb[:, self.skip_ch:]
+            skip_mod = (1.0 + gamma) * skip + beta                   # γ = 1 + γ_raw (identity init)
+            output = output + self.skip_proj(skip_mod)
+        return output
 
 
 class _DecoderBlock(nn.Module):

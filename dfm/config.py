@@ -39,7 +39,8 @@ class DFMConfig:
 
     # --- decoder (slots → image): full transformer (cross + self-attention) ---
     n_dec_layers: int = 4     # transformer decoder blocks (cross-attn slots + self-attn patches)
-    skip_ch: int = 32         # shallow skip-encoder channels (initial-frame anchor)
+    skip_ch: int = 32         # shallow skip-encoder channels (initial-frame anchor).  The skip
+                              # is fused via FiLM: latent patch tokens gate/scale it (γ⊙skip+β).
 
     # --- training rollout ---
     horizon: int = 4          # nominal horizon (eval / validation / inference default)

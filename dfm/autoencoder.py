@@ -118,15 +118,21 @@ class LatentAutoencoder(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        # Zero-init the final synthesis layers → decoder starts as a pass-through
-        # of the tent-folded output (residual refinement learned).
-        for seq in [self.decoder.synth.head, self.decoder.synth.post_conv]:
-            for child in reversed(list(seq.children())):
-                if isinstance(child, (nn.Linear, nn.Conv2d)):
-                    nn.init.zeros_(child.weight)
-                    if child.bias is not None:
-                        nn.init.zeros_(child.bias)
-                    break
+        # Zero-init the final synthesis layers → decoder starts as a pass-through of the
+        # tent-folded output.  FiLM skip fusion starts as identity (γ=1, β=0) with no skip
+        # residual yet; the head's last layer starts at zero too.
+        synth = self.decoder.synth
+        if hasattr(synth, 'film_gen'):
+            for m in (synth.film_gen, synth.skip_proj):
+                nn.init.zeros_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for child in reversed(list(synth.head.children())):
+            if isinstance(child, (nn.Linear, nn.Conv2d)):
+                nn.init.zeros_(child.weight)
+                if child.bias is not None:
+                    nn.init.zeros_(child.bias)
+                break
 
     def encode(self, x0: torch.Tensor, xt: torch.Tensor,
                pixel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
