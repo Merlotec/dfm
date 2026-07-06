@@ -25,8 +25,9 @@ from einops import rearrange
 from typing import Optional, Tuple
 
 from .config import DFMConfig
-from .modules import (PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SkipEncoder,
-                      sincos_2d, SlotHierarchyMask, slot_log_bias, add_relative_noise)
+from .modules import (PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SelfAttnBlock,
+                      SkipEncoder, sincos_2d, SlotHierarchyMask, slot_log_bias,
+                      add_relative_noise)
 from .decoder import SlotDecoder
 from .discriminator import DFMDiscriminator
 from .losses import FluidLoss
@@ -58,6 +59,12 @@ class PairEncoder(nn.Module):
         self.slots      = nn.Parameter(torch.zeros(1, cfg.n_slots, cfg.d_model))
         self.slot_cross = CrossAttnBlock(cfg.d_model, cfg.d_model, cfg.n_heads,
                                          cfg.mlp_ratio, cfg.dropout)
+        # slot self-attention (causal over the priority axis → prefix-invariant)
+        self.slot_layers  = nn.ModuleList([
+            SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
+            for _ in range(cfg.n_slot_layers)
+        ])
+        self.slot_causal = cfg.slot_hierarchy
         nn.init.trunc_normal_(self.slots, std=0.02)
 
     def forward(self, x0: torch.Tensor, xt: torch.Tensor,
@@ -74,7 +81,10 @@ class PairEncoder(nn.Module):
         tok = rearrange(self.patch_embed(x), 'b h w d -> b (h w) d') + self.pos
         for layer in self.layers:
             tok = layer(tok)
-        return self.slot_cross(self.slots.expand(B, -1, -1), tok)   # [B, n_slots, d]
+        slots = self.slot_cross(self.slots.expand(B, -1, -1), tok)  # [B, n_slots, d]
+        for blk in self.slot_layers:                               # causal slot mixing
+            slots = blk(slots, causal=self.slot_causal)
+        return slots
 
 
 # ---------------------------------------------------------------------------

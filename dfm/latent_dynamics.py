@@ -27,7 +27,7 @@ from .evolution import EvolutionOperator
 from .context_encoder import ContextEncoder
 from .encoder import FrameEncoder
 from .autoencoder import LatentAutoencoder
-from .modules import add_relative_noise
+from .modules import add_relative_noise, SlotHierarchyMask, slot_log_bias
 
 
 class LatentDynamics(nn.Module):
@@ -44,7 +44,10 @@ class LatentDynamics(nn.Module):
     def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
-        self.operator       = EvolutionOperator(cfg)     # evolves the delta latent L_t
+        # Delta operator over the *ordered* latent: causal slot self-attention (slot i
+        # attends to 0..i) when dynamics_hierarchy is on, so evolving a truncated latent
+        # is the exact prefix of the full evolution (width-invariant nesting).
+        self.operator       = EvolutionOperator(cfg, causal_slots=cfg.dynamics_hierarchy)
         self.state_encoder  = FrameEncoder(cfg)          # s = encode(frame)
         self.state_proj     = (nn.Linear(cfg.d_model, cfg.d_ctx)
                                if cfg.d_model != cfg.d_ctx else nn.Identity())
@@ -78,9 +81,10 @@ class LatentDynamics(nn.Module):
         return self.state_dynamics(s_raw, context, step_idx)
 
     def forward(self, latent: torch.Tensor, context: torch.Tensor,
-                state: torch.Tensor, step_idx) -> torch.Tensor:
+                state: torch.Tensor, step_idx,
+                key_bias: torch.Tensor | None = None) -> torch.Tensor:
         combined = torch.cat([context, state], dim=1)   # [B, K + n_slots, d_ctx]
-        return self.operator(latent, combined, step_idx)
+        return self.operator(latent, combined, step_idx, key_bias)
 
 
 class LatentDynamicsTrainer:
@@ -105,6 +109,7 @@ class LatentDynamicsTrainer:
         self.ae              = LatentAutoencoder(cfg)     # frozen (load_ae)
         self.context_encoder = ContextEncoder(cfg)
         self.dynamics        = LatentDynamics(cfg)
+        self.state_mask      = SlotHierarchyMask(cfg)     # state-hierarchy sampler
         self.pixel_mask      = pixel_mask
 
         for p in self.ae.parameters():
@@ -163,19 +168,27 @@ class LatentDynamicsTrainer:
                 [latents[t][bi] for t in range(pred_len)]).half().cpu()
         return latents
 
-    def _sample_active_slots(self) -> int:
-        """Random hard slot width for nested-dynamics training (full width when disabled).
+    def _context_latents(self, x0, context_frames, pixel_mask) -> torch.Tensor:
+        """Frozen-AE latents of the context frames, anchored at x0 → [B, F, n_slots, d].
 
-        Draws from a small fixed set of nested widths {K, K/2, K/4, K/8} so torch.compile
-        sees only a handful of slot-dim shapes (no recompile storm); with probability
-        `slot_full_prob` the full width K is used, keeping full-width evolution dominant.
+        These feed the ContextEncoder (which aggregates them into the conditioning
+        tokens).  The AE is frozen, so this is a detached forward — grad flows only
+        through the ContextEncoder that consumes the result.
         """
-        K = self.cfg.n_slots
-        if not self.cfg.dynamics_hierarchy or torch.rand(()) < self.cfg.slot_full_prob:
-            return K
-        lo = max(1, int(self.cfg.slot_cutoff_min))
-        widths = sorted({w for w in (K // 2, K // 4, K // 8) if w >= lo}) or [K]
-        return widths[int(torch.randint(len(widths), ()).item())]
+        with torch.no_grad():
+            ls = [self.ae.encode(x0, f, pixel_mask).detach() for f in context_frames]
+        return torch.stack(ls, dim=1)                             # [B, F, K, d]
+
+    def _state_key_bias(self, B: int, n_ctx: int, n: int, device) -> Optional[torch.Tensor]:
+        """Training-time additive bias on the operator's cross-attn keys for the state
+        hierarchy: 0 on the context keys, a sampled log-ramp on the state keys.  Returns
+        [n·B, n_ctx + n_slots] (t-major, matching the batched step) or None when off."""
+        if not self.cfg.state_hierarchy:
+            return None
+        w  = self.state_mask.sample(B, device)                       # [B, n_slots]
+        sb = slot_log_bias(w)                                        # [B, n_slots]
+        kb = torch.cat([torch.zeros(B, n_ctx, device=device, dtype=sb.dtype), sb], dim=1)
+        return kb.repeat(n, 1)                                       # [n·B, n_ctx + n_slots]
 
     def step(self, context_frames: List[torch.Tensor],
              pred_frames: List[torch.Tensor],
@@ -196,11 +209,12 @@ class LatentDynamicsTrainer:
         x0 = pred_frames[0]
         # anchored latent sequence  L_0 (= encode(X_0,X_0)) .. L_n  (cached; detached)
         latents = self._cached_targets(x0, pred_frames, pixel_mask, index)
+        ctx_lat = self._context_latents(x0, context_frames, pixel_mask)
         n = len(latents) - 1
 
         self.optimizer.zero_grad()
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-            context = self.context_encoder(context_frames, pixel_mask=pixel_mask)
+            context = self.context_encoder(ctx_lat)
 
             # denoising regularizer: feed a noised L_t but supervise against the clean
             # L_{t+1}, so the operator learns to correct off-manifold drift at rollout.
@@ -216,18 +230,20 @@ class LatentDynamicsTrainer:
             L_tgt = torch.cat(latents[1:n + 1], dim=0)                          # clean  L_1..L_n
             ctx_rep = context.repeat(n, 1, 1)                                   # same context per step
 
-            # nested dynamics: evolve/supervise only a random low-rank prefix of the slots,
-            # so the operator learns to advance the latent at any width (state stays full).
-            K = self._sample_active_slots()
-            if K < self.cfg.n_slots:
-                L_in, L_tgt = L_in[:, :K], L_tgt[:, :K]
+            # state hierarchy: soft prefix-mask on the operator's cross-attention over the
+            # *state* keys (context keys unbiased), so the state encoder front-loads and the
+            # state can be truncated to the active width at inference.  [n·B, n_ctx + n_slots]
+            kb = self._state_key_bias(B, context.shape[1], n, x0.device)
 
+            # With dynamics_hierarchy the operator's slot self-attention is causal, so the
+            # first-N evolution is the exact prefix of the full-width evolution — no need to
+            # train on random truncations; full-width supervision covers every prefix.
             if self.cfg.evolve_state:
                 # per-step full-state encodings (with grad → trains the encoder via the
                 # delta path); detached copies are the teacher targets for state evolution.
                 s_raw  = [self.dynamics.encode_state_raw(f, pixel_mask) for f in pred_frames]
                 s_proj = torch.cat([self.dynamics.project_state(s) for s in s_raw[:n]], dim=0)
-                dp = self.dynamics(L_in, ctx_rep, s_proj, steps)               # L_t → L_{t+1}
+                dp = self.dynamics(L_in, ctx_rep, s_proj, steps, key_bias=kb)   # L_t → L_{t+1}
                 delta_loss = F.mse_loss(dp.float(), L_tgt.float())
                 s_in  = torch.cat([s.detach() for s in s_raw[:n]],     dim=0)
                 s_tgt = torch.cat([s.detach() for s in s_raw[1:n + 1]], dim=0)
@@ -236,7 +252,7 @@ class LatentDynamicsTrainer:
                 loss = delta_loss + self.cfg.state_loss_weight * state_loss
             else:
                 state = self.dynamics.encode_state(x0, pixel_mask)             # fixed anchor s_0
-                pred  = self.dynamics(L_in, ctx_rep, state.repeat(n, 1, 1), steps)
+                pred  = self.dynamics(L_in, ctx_rep, state.repeat(n, 1, 1), steps, key_bias=kb)
                 loss  = F.mse_loss(pred.float(), L_tgt.float())
 
         if not torch.isfinite(loss):
@@ -269,15 +285,18 @@ class LatentDynamicsTrainer:
         anchor is reset to the latest prediction (0 = never).
 
         `n_active_slots` (ordered-slot hierarchy only): keep just the first N slots of
-        the latent through the *whole* pipeline — the operator evolves N slots and the
-        decoder reads N slots (real compute savings).  The state stream stays full width.
-        Graceful only if the operator was trained nested (cfg.dynamics_hierarchy); on a
-        non-nested checkpoint this truncates an out-of-distribution operator input.
+        the latent through the *whole* pipeline — the operator evolves N slots, the decoder
+        reads N slots, and (with state_hierarchy) the anchor state is truncated to N too, so
+        the conditioning scales with the chosen complexity.  Graceful only if trained nested
+        (cfg.dynamics_hierarchy / state_hierarchy).
         """
         self.ae.eval(); self.context_encoder.eval(); self.dynamics.eval()
-        context = self.context_encoder(context_frames, pixel_mask=pixel_mask)
+        # context anchored at the initial x0 (the run fingerprint is computed once)
+        context = self.context_encoder(self._context_latents(x0, context_frames, pixel_mask))
         N = n_active_slots
         trunc = (lambda L: L[:, :N].contiguous()) if N is not None else (lambda L: L)
+        # state conditioning is truncated to the active width only when it was trained nested
+        strunc = trunc if (N is not None and self.cfg.state_hierarchy) else (lambda L: L)
         anchor  = x0
         latent  = trunc(self.ae.encode(anchor, anchor, pixel_mask))
         s_raw   = self.dynamics.encode_state_raw(anchor, pixel_mask)  # s_0 for this anchor
@@ -285,7 +304,7 @@ class LatentDynamicsTrainer:
         for i in range(n_steps):
             if self.cfg.evolve_state:
                 s_raw = self.dynamics.evolve_state(s_raw, context, i)  # evolve state in latent (no decode)
-            state  = self.dynamics.project_state(s_raw)
+            state  = strunc(self.dynamics.project_state(s_raw))        # first-N state tokens
             latent = self.dynamics(latent, context, state, i)          # operator over N slots
             pred   = self.ae.decode(anchor, latent, pixel_mask)        # decode from N slots
             if pixel_mask is not None:
@@ -308,7 +327,7 @@ class LatentDynamicsTrainer:
             pred_frames    = [pred_b[:, t].to(device)    for t in range(pred_b.shape[1])]
             x0 = pred_frames[0]
             latents = self._encode_targets(x0, pred_frames, pixel_mask)
-            context = self.context_encoder(context_frames, pixel_mask=pixel_mask)
+            context = self.context_encoder(self._context_latents(x0, context_frames, pixel_mask))
             n = len(latents) - 1
             if self.cfg.evolve_state:
                 states = [self.dynamics.encode_state(f, pixel_mask) for f in pred_frames]

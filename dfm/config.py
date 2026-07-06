@@ -80,11 +80,20 @@ class DFMConfig:
     slot_hierarchy: bool = False
     slot_full_prob: float = 0.25   # fraction of steps trained at full width (all slots, w=1)
     slot_cutoff_min: float = 1.0   # min ramp zero-crossing c (>=1 → slot 0 always fully active)
+    # Slot self-attention layers in the encoder & decoder (0 = none).  When slot_hierarchy
+    # is on these are *causal* over the priority axis (slot i attends to 0..i), so the
+    # first-N slots stay exactly invariant to the total width.
+    n_slot_layers: int = 0
 
     # Nested dynamics: also train the evolution operator on random slot-prefixes, so the
     # latent can be *evolved* (not just decoded) at reduced width for real operator compute
     # savings.  Only meaningful with slot_hierarchy (an ordered latent); needs a phase-2 run.
     dynamics_hierarchy: bool = False
+    # Hierarchical anchor state: soft-mask the operator's cross-attention over the state
+    # tokens in training so the state encoder front-loads importance, then truncate the
+    # state to the active width at inference — so the anchor conditioning also scales with
+    # the chosen complexity (a simple fluid needs fewer state tokens than a complex one).
+    state_hierarchy: bool = False
 
     # --- GAN discriminator ---
     disc_dim: int = 128

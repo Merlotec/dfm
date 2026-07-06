@@ -23,7 +23,7 @@ def main():
         disc_dim=16, ae_max_delta=4, n_context_frames=2, horizon_max=6,
         slot_hierarchy=True, slot_full_prob=0.25,
         latent_noise_std=0.1, ae_decode_noise_std=0.05,
-        dynamics_hierarchy=True,
+        dynamics_hierarchy=True, n_slot_layers=2, state_hierarchy=True,
     )
     B, C, H, W = 2, cfg.in_channels, cfg.img_size, cfg.img_size
     pm = torch.ones(1, 1, H, W, dtype=torch.bool); pm[..., :4, :] = False

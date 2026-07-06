@@ -139,6 +139,14 @@ class SlotDecoder(nn.Module):
         # decoder knows *which* rank it is reading/attenuating (ordered-slot anchor).
         self.rank_embed = nn.Parameter(torch.zeros(1, cfg.n_slots, cfg.d_model))
 
+        # slot self-attention (causal over the priority axis → prefix-invariant), applied
+        # to the latent before the patch queries read it.
+        self.slot_layers = nn.ModuleList([
+            SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
+            for _ in range(cfg.n_slot_layers)
+        ])
+        self.slot_causal = cfg.slot_hierarchy
+
         self.layers = nn.ModuleList([
             _DecoderBlock(cfg) for _ in range(cfg.n_dec_layers)
         ])
@@ -156,6 +164,8 @@ class SlotDecoder(nn.Module):
         P = self.cfg.n_patch
 
         slots = slots + self.rank_embed[:, :slots.shape[1]]  # rank tag (sliced if truncated)
+        for blk in self.slot_layers:                         # causal slot mixing
+            slots = blk(slots, causal=self.slot_causal)
         q = self.query.expand(B, P * P, -1) + self.pos      # [B, P², d]
         for layer in self.layers:
             q = layer(q, slots, key_bias)                   # cross-attn (masked) → self-attn

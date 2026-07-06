@@ -114,9 +114,17 @@ class SelfAttnBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.ffn   = FeedForward(dim, mlp_ratio, dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, causal: bool = False) -> torch.Tensor:
         n = self.norm1(x)
-        x = x + self.attn(n, n, n, need_weights=False)[0]
+        # causal=True → token i attends only to 0..i (prefix mask over the ordered slot
+        # axis), so the first-N tokens are invariant to the total count.  The explicit
+        # mask is required by nn.MultiheadAttention; is_causal lets it take the fast path.
+        attn_mask = None
+        if causal:
+            L = x.shape[1]
+            attn_mask = torch.triu(
+                torch.full((L, L), float('-inf'), device=x.device, dtype=n.dtype), diagonal=1)
+        x = x + self.attn(n, n, n, need_weights=False, attn_mask=attn_mask, is_causal=causal)[0]
         x = x + self.ffn(self.norm2(x))
         return x
 

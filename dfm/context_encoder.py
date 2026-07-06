@@ -1,34 +1,34 @@
 """
-ContextEncoder: learns the underlying PDE dynamics from a sequence of history
-frames and summarises them into K context tokens [B, K, d_ctx].
+ContextEncoder: summarises "which dynamics" into K context tokens [B, K, d_ctx].
 
-These tokens condition the latent evolution operator (via cross-attention at
-every rollout step), telling it *which* dynamics to integrate.  The summary is
-produced by learned query vectors (Perceiver-style) that cross-attend to all
-T·P² spatiotemporal frame tokens.
+Instead of re-encoding raw history pixels, it operates on the *frozen-AE latents*
+of the context frames — each context frame X_j is encoded (anchored at the rollout
+start X_0) as  L_j = AE.encode(X_0, X_j), and the encoder aggregates the set of
+those latents into the conditioning tokens.  This reuses the AE's representation
+(no second image encoder) and keeps the conditioning in the same latent space the
+evolution operator works in.
+
+Input:  ctx_latents [B, F, n_slots, d_model]  (F = n_context frames)
+Output: context     [B, n_ctx_tokens, d_ctx]
 """
 
 import torch
 import torch.nn as nn
-from einops import rearrange
-from typing import List, Optional
 
 from .config import DFMConfig
-from .modules import PatchEmbed, FeedForward, SelfAttnBlock, sincos_2d
+from .modules import FeedForward, SelfAttnBlock
 from .attention import CrossAttention
 
 
 class ContextEncoder(nn.Module):
-    spatial_pos: torch.Tensor
-
     def __init__(self, cfg: DFMConfig):
         super().__init__()
-        P = cfg.img_size // cfg.ctx_patch_px
+        self.cfg = cfg
 
-        self.patch_embed  = PatchEmbed(cfg.in_channels + 1, cfg.ctx_patch_px, cfg.d_ctx)
-        self.register_buffer('spatial_pos', sincos_2d(P, cfg.d_ctx).unsqueeze(0),
-                             persistent=False)             # [1, P², d_ctx]
-        self.temporal_pos = nn.Embedding(64, cfg.d_ctx)   # up to 64 input frames
+        # AE latents are d_model; the conditioning space is d_ctx
+        self.in_proj = (nn.Linear(cfg.d_model, cfg.d_ctx)
+                        if cfg.d_model != cfg.d_ctx else nn.Identity())
+        self.frame_emb = nn.Embedding(64, cfg.d_ctx)   # which context frame (history position)
 
         self.layers = nn.ModuleList([
             SelfAttnBlock(cfg.d_ctx, cfg.n_ctx_heads, cfg.mlp_ratio, cfg.dropout)
@@ -43,7 +43,6 @@ class ContextEncoder(nn.Module):
         self.summary_ffn      = FeedForward(cfg.d_ctx, cfg.mlp_ratio, cfg.dropout)
         self.summary_norm_ffn = nn.LayerNorm(cfg.d_ctx)
 
-        self.cfg = cfg
         self._init_weights()
 
     def _init_weights(self):
@@ -57,26 +56,12 @@ class ContextEncoder(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, frames: List[torch.Tensor],
-                pixel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B = frames[0].shape[0]
-        H, W = frames[0].shape[2], frames[0].shape[3]
-
-        if pixel_mask is not None:
-            mask_ch = pixel_mask.float().expand(B, 1, H, W)
-        else:
-            mask_ch = torch.ones(B, 1, H, W, device=frames[0].device, dtype=frames[0].dtype)
-
-        tokens: List[torch.Tensor] = []
-        for t, frame in enumerate(frames):
-            if pixel_mask is not None:
-                frame = frame * pixel_mask
-            frame_aug = torch.cat([frame, mask_ch], dim=1)
-            tok = rearrange(self.patch_embed(frame_aug), 'b h w d -> b (h w) d')  # [B, P², d_ctx]
-            tok = tok + self.spatial_pos + self.temporal_pos.weight[t]
-            tokens.append(tok)
-
-        x = torch.cat(tokens, dim=1)                             # [B, T·P², d_ctx]
+    def forward(self, ctx_latents: torch.Tensor) -> torch.Tensor:
+        """ctx_latents: [B, F, n_slots, d_model] → context [B, n_ctx_tokens, d_ctx]."""
+        B, F, K, _ = ctx_latents.shape
+        x = self.in_proj(ctx_latents)                             # [B, F, K, d_ctx]
+        x = x + self.frame_emb.weight[:F].view(1, F, 1, -1)       # tag which frame
+        x = x.reshape(B, F * K, -1)                               # [B, F·K, d_ctx]
         for layer in self.layers:
             x = layer(x)
 
@@ -84,4 +69,4 @@ class ContextEncoder(nn.Module):
         kv = self.summary_norm_kv(x)
         q  = q + self.summary_cross(self.summary_norm_q(q), kv)
         q  = q + self.summary_ffn(self.summary_norm_ffn(q))
-        return q                                                 # [B, K, d_ctx]
+        return q                                                  # [B, n_ctx_tokens, d_ctx]
