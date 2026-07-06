@@ -52,8 +52,8 @@
   },
 
   "training": {
-    "batch_size": 4,
-    "n_epochs": 100,
+    "batch_size": 86,
+    "n_epochs": 1000,
 
     "lr": 1e-4,
     "weight_decay": 1e-5,
@@ -62,7 +62,7 @@
     "l1_weight": 0.1,
     "latent_loss_weight": 0.1,
 
-    "num_workers": 4,
+    "num_workers": 8,
     "cache_frames": false,
     "compile": true
   }
