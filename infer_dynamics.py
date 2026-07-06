@@ -43,6 +43,9 @@ def main():
     p.add_argument('--n-predict',     type=int, default=10)
     p.add_argument('--reencode-every', type=int, default=None,
                    help='decode-based re-anchor cadence (0 = pure latent rollout; defaults to cfg)')
+    p.add_argument('--n-active-slots', type=int, default=None,
+                   help='ordered-slot hierarchy: decode from only the first N slots '
+                        '(compute/quality dial; default = all slots)')
     p.add_argument('--seq-start',     type=int, default=None)
     p.add_argument('--first-frame',   type=int, default=20)
     p.add_argument('--no-images',     action='store_true')
@@ -62,8 +65,9 @@ def main():
     trainer.load(args.checkpoint)
     n_context = args.n_context if args.n_context is not None else cfg.n_context_frames
     reencode  = args.reencode_every if args.reencode_every is not None else cfg.reencode_every
+    n_active = args.n_active_slots
     print(f'  step={ckpt.get("global_step", "?")}  evolve_state={cfg.evolve_state}  '
-          f'reencode_every={reencode}')
+          f'reencode_every={reencode}  n_active_slots={n_active or cfg.n_slots}')
 
     # ---- data ----
     stats_dir = Path(args.stats_dir) if args.stats_dir else data_dir
@@ -98,7 +102,8 @@ def main():
 
         # ---- latent rollout ----
         preds_list = trainer.rollout(context_frames, x0, n_steps=args.n_predict,
-                                     reencode_every=reencode, pixel_mask=pixel_mask)
+                                     reencode_every=reencode, pixel_mask=pixel_mask,
+                                     n_active_slots=n_active)
 
         preds, gt = [], []
         for t, pred in enumerate(preds_list):

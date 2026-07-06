@@ -155,7 +155,7 @@ class SlotDecoder(nn.Module):
         B = slots.shape[0]
         P = self.cfg.n_patch
 
-        slots = slots + self.rank_embed                     # tag each slot with its rank
+        slots = slots + self.rank_embed[:, :slots.shape[1]]  # rank tag (sliced if truncated)
         q = self.query.expand(B, P * P, -1) + self.pos      # [B, P², d]
         for layer in self.layers:
             q = layer(q, slots, key_bias)                   # cross-attn (masked) → self-attn

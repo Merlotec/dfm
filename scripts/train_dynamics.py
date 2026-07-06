@@ -54,6 +54,9 @@ def main():
     p.add_argument('--data',       type=Path, default=DEFAULT_DATA_DIR)
     p.add_argument('--test-data',  type=Path, default=DEFAULT_TEST_DIR)
     p.add_argument('--resume',     type=str, default=None, nargs='?', const='latest')
+    p.add_argument('--init-dyn',   type=str, default=None,
+                   help='Warm-start the dynamics + context encoder from a checkpoint with a '
+                        'FRESH optimizer/schedule (fine-tune, e.g. nested from non-hier weights)')
     p.add_argument('--epochs',     type=int, default=None)
     p.add_argument('--batch-size', type=int, default=None)
     p.add_argument('--num-workers', type=int, default=None,
@@ -64,6 +67,9 @@ def main():
     p.add_argument('--log-every',  type=int, default=50)
     p.add_argument('--evolve-state', action='store_true',
                    help='Also evolve the state embedding s_t in latent (optional second stream)')
+    p.add_argument('--dynamics-hierarchy', action='store_true',
+                   help='Nested dynamics: train the operator on random slot-prefixes so the '
+                        'latent can be evolved at reduced width (needs an ordered/slot_hierarchy AE)')
     p.add_argument('--no-compile', action='store_true',
                    help='Disable torch.compile even if enabled in hyperparams.json')
     p.add_argument('--profile', type=int, default=0, metavar='N',
@@ -75,7 +81,9 @@ def main():
     cfg, train_hp = load_config()
     if args.evolve_state:
         cfg.evolve_state = True
-    print(f'evolve_state: {cfg.evolve_state}')
+    if args.dynamics_hierarchy:
+        cfg.dynamics_hierarchy = True
+    print(f'evolve_state: {cfg.evolve_state}  dynamics_hierarchy: {cfg.dynamics_hierarchy}')
     n_epochs   = args.epochs or train_hp['n_epochs']
     batch_size = args.batch_size or train_hp['batch_size']
     num_workers  = args.num_workers if args.num_workers is not None else train_hp.get('num_workers', 4)
@@ -122,6 +130,11 @@ def main():
     trainer.load_ae(args.ae)
 
     CKPT_DIR.mkdir(exist_ok=True)
+    if args.resume and args.init_dyn:
+        raise SystemExit('Use either --resume (continue a run) or --init-dyn (fresh fine-tune), not both.')
+    if args.init_dyn:
+        print(f'Warm-start (weights only, fresh schedule) from {args.init_dyn}')
+        trainer.init_from(args.init_dyn)
     if args.resume == 'latest':
         cands = sorted(CKPT_DIR.glob('dyn_*.pt'))
         args.resume = str(cands[-1]) if cands else None

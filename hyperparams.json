@@ -26,6 +26,7 @@
     "slot_hierarchy": true,
     "slot_full_prob": 0.25,
     "slot_cutoff_min": 1.0,
+    "dynamics_hierarchy": true,
 
     "latent_noise_std": 0.1,
     "ae_decode_noise_std": 0.05,

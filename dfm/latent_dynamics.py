@@ -163,6 +163,20 @@ class LatentDynamicsTrainer:
                 [latents[t][bi] for t in range(pred_len)]).half().cpu()
         return latents
 
+    def _sample_active_slots(self) -> int:
+        """Random hard slot width for nested-dynamics training (full width when disabled).
+
+        Draws from a small fixed set of nested widths {K, K/2, K/4, K/8} so torch.compile
+        sees only a handful of slot-dim shapes (no recompile storm); with probability
+        `slot_full_prob` the full width K is used, keeping full-width evolution dominant.
+        """
+        K = self.cfg.n_slots
+        if not self.cfg.dynamics_hierarchy or torch.rand(()) < self.cfg.slot_full_prob:
+            return K
+        lo = max(1, int(self.cfg.slot_cutoff_min))
+        widths = sorted({w for w in (K // 2, K // 4, K // 8) if w >= lo}) or [K]
+        return widths[int(torch.randint(len(widths), ()).item())]
+
     def step(self, context_frames: List[torch.Tensor],
              pred_frames: List[torch.Tensor],
              pixel_mask: Optional[torch.Tensor] = None,
@@ -201,6 +215,12 @@ class LatentDynamicsTrainer:
             L_in  = add_relative_noise(torch.cat(latents[:n], dim=0), ns)       # noised L_0..L_{n-1}
             L_tgt = torch.cat(latents[1:n + 1], dim=0)                          # clean  L_1..L_n
             ctx_rep = context.repeat(n, 1, 1)                                   # same context per step
+
+            # nested dynamics: evolve/supervise only a random low-rank prefix of the slots,
+            # so the operator learns to advance the latent at any width (state stays full).
+            K = self._sample_active_slots()
+            if K < self.cfg.n_slots:
+                L_in, L_tgt = L_in[:, :K], L_tgt[:, :K]
 
             if self.cfg.evolve_state:
                 # per-step full-state encodings (with grad → trains the encoder via the
@@ -248,30 +268,33 @@ class LatentDynamicsTrainer:
         L_0 = encode(X_0, X_0) (zero evolution); every `reencode_every` steps the
         anchor is reset to the latest prediction (0 = never).
 
-        `n_active_slots` (ordered-slot hierarchy only): decode from just the first
-        N slots — the compute/quality dial that a nested latent enables.
+        `n_active_slots` (ordered-slot hierarchy only): keep just the first N slots of
+        the latent through the *whole* pipeline — the operator evolves N slots and the
+        decoder reads N slots (real compute savings).  The state stream stays full width.
+        Graceful only if the operator was trained nested (cfg.dynamics_hierarchy); on a
+        non-nested checkpoint this truncates an out-of-distribution operator input.
         """
         self.ae.eval(); self.context_encoder.eval(); self.dynamics.eval()
         context = self.context_encoder(context_frames, pixel_mask=pixel_mask)
-        slot_w  = (self.ae.slot_mask.hard(x0.shape[0], n_active_slots, x0.device)
-                   if n_active_slots is not None else None)
+        N = n_active_slots
+        trunc = (lambda L: L[:, :N].contiguous()) if N is not None else (lambda L: L)
         anchor  = x0
-        latent  = self.ae.encode(anchor, anchor, pixel_mask)
+        latent  = trunc(self.ae.encode(anchor, anchor, pixel_mask))
         s_raw   = self.dynamics.encode_state_raw(anchor, pixel_mask)  # s_0 for this anchor
         preds: List[torch.Tensor] = []
         for i in range(n_steps):
             if self.cfg.evolve_state:
                 s_raw = self.dynamics.evolve_state(s_raw, context, i)  # evolve state in latent (no decode)
             state  = self.dynamics.project_state(s_raw)
-            latent = self.dynamics(latent, context, state, i)
-            pred   = self.ae.decode(anchor, latent, pixel_mask, slot_w)
+            latent = self.dynamics(latent, context, state, i)          # operator over N slots
+            pred   = self.ae.decode(anchor, latent, pixel_mask)        # decode from N slots
             if pixel_mask is not None:
                 pred = pred * pixel_mask
             preds.append(pred)
             if reencode_every > 0 and (i + 1) % reencode_every == 0 and i + 1 < n_steps:
                 # decode-based re-anchor: refreshes detail, delta budget, and re-syncs s
                 anchor = pred
-                latent = self.ae.encode(anchor, anchor, pixel_mask)
+                latent = trunc(self.ae.encode(anchor, anchor, pixel_mask))
                 s_raw  = self.dynamics.encode_state_raw(anchor, pixel_mask)
         return preds
 
@@ -310,6 +333,21 @@ class LatentDynamicsTrainer:
             'cfg':             self.cfg,
             'global_step':     self.global_step,
         }, path)
+
+    def init_from(self, path: str):
+        """Warm-start: load only the trainable model weights (dynamics + context
+        encoder) from a prior checkpoint, keeping a FRESH optimizer/scheduler/step.
+
+        Unlike `load`, this does not restore the optimizer state, LR schedule, or
+        global_step — so a converged checkpoint can be fine-tuned on a fresh schedule
+        (e.g. warm-starting the nested-dynamics run from non-hierarchical weights).
+        The frozen AE is untouched here; set it via `load_ae`.
+        """
+        def _u(m): return getattr(m, '_orig_mod', m)
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        _u(self.dynamics).load_state_dict(ckpt['dynamics'], strict=False)
+        if 'context_encoder' in ckpt:
+            _u(self.context_encoder).load_state_dict(ckpt['context_encoder'], strict=False)
 
     def load(self, path: str):
         def _u(m): return getattr(m, '_orig_mod', m)

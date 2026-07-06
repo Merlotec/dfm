@@ -81,6 +81,11 @@ class DFMConfig:
     slot_full_prob: float = 0.25   # fraction of steps trained at full width (all slots, w=1)
     slot_cutoff_min: float = 1.0   # min ramp zero-crossing c (>=1 → slot 0 always fully active)
 
+    # Nested dynamics: also train the evolution operator on random slot-prefixes, so the
+    # latent can be *evolved* (not just decoded) at reduced width for real operator compute
+    # savings.  Only meaningful with slot_hierarchy (an ordered latent); needs a phase-2 run.
+    dynamics_hierarchy: bool = False
+
     # --- GAN discriminator ---
     disc_dim: int = 128
     disc_adv_weight: float = 0.02
