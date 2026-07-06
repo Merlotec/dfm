@@ -56,6 +56,11 @@ def main():
     p.add_argument('--resume',     type=str, default=None, nargs='?', const='latest')
     p.add_argument('--epochs',     type=int, default=None)
     p.add_argument('--batch-size', type=int, default=None)
+    p.add_argument('--num-workers', type=int, default=None,
+                   help='Override dataloader workers (0 avoids fork; use under tight SLURM --mem)')
+    p.add_argument('--no-latent-cache', action='store_true',
+                   help='Do not cache frozen-AE target latents in RAM (re-encode each epoch; '
+                        'bounds memory at the cost of throughput)')
     p.add_argument('--log-every',  type=int, default=50)
     p.add_argument('--evolve-state', action='store_true',
                    help='Also evolve the state embedding s_t in latent (optional second stream)')
@@ -73,7 +78,7 @@ def main():
     print(f'evolve_state: {cfg.evolve_state}')
     n_epochs   = args.epochs or train_hp['n_epochs']
     batch_size = args.batch_size or train_hp['batch_size']
-    num_workers  = train_hp.get('num_workers', 4)
+    num_workers  = args.num_workers if args.num_workers is not None else train_hp.get('num_workers', 4)
     cache_frames = train_hp.get('cache_frames', False)
 
     # pred window = [X_0, X_1, ..., X_{horizon_max}]  (the anchored sequence).
@@ -104,6 +109,10 @@ def main():
         clip_grad=train_hp['clip_grad'], total_steps=total_steps,
         pixel_mask=pixel_mask,
     ).to(device)
+
+    if args.no_latent_cache:
+        trainer.cache_latents = False
+        print('Latent cache: OFF (re-encoding targets each epoch)')
 
     print(f'Loading frozen AE: {args.ae}')
     trainer.load_ae(args.ae)
@@ -140,9 +149,14 @@ def main():
 
     prof  = LoopProfiler(device)
     tprof = make_profiler(args.profile > 0, device)
+    # Build the loader ONCE and reuse it across epochs: with persistent_workers the
+    # worker processes are forked a single time (at startup, when the parent is
+    # smallest) and stay alive.  Re-creating it per epoch would re-fork against an
+    # ever-larger parent (the latent cache grows in-process) → fork ENOMEM.
+    train_dl = dm.train_dataloader()
     for epoch in range(start_epoch, n_epochs):
         lsum, lcnt = 0.0, 0
-        for idx_b, context_b, pred_b in dm.train_dataloader():
+        for idx_b, context_b, pred_b in train_dl:
             prof.data_ready()
             context_frames = [context_b[:, t].to(device) for t in range(context_b.shape[1])]
             pred_frames    = [pred_b[:, t].to(device)    for t in range(pred_b.shape[1])]

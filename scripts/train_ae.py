@@ -60,6 +60,8 @@ def main():
     p.add_argument('--resume',     type=str, default=None, nargs='?', const='latest')
     p.add_argument('--epochs',     type=int, default=None)
     p.add_argument('--batch-size', type=int, default=None)
+    p.add_argument('--num-workers', type=int, default=None,
+                   help='Override dataloader workers (0 avoids fork; use under tight SLURM --mem)')
     p.add_argument('--log-every',  type=int, default=50)
     p.add_argument('--no-compile', action='store_true',
                    help='Disable torch.compile even if enabled in hyperparams.json')
@@ -72,7 +74,7 @@ def main():
     cfg, train_hp = load_config()
     n_epochs   = args.epochs or train_hp['n_epochs']
     batch_size = args.batch_size or train_hp['batch_size']
-    num_workers  = train_hp.get('num_workers', 4)
+    num_workers  = args.num_workers if args.num_workers is not None else train_hp.get('num_workers', 4)
     cache_frames = train_hp.get('cache_frames', False)
 
     # pred window = [X_0, X_1, ..., X_{ae_max_delta}]  → pairs sampled from it
@@ -139,9 +141,13 @@ def main():
 
     prof  = LoopProfiler(device)
     tprof = make_profiler(args.profile > 0, device)
+    # Build the loader ONCE and reuse it across epochs: with persistent_workers the
+    # workers are forked a single time at startup and stay alive, instead of
+    # re-forking against an ever-larger parent each epoch (fork ENOMEM).
+    train_dl = dm.train_dataloader()
     for epoch in range(start_epoch, n_epochs):
         rsum, rcnt = 0.0, 0
-        for _, pred_b in dm.train_dataloader():
+        for _, pred_b in train_dl:
             prof.data_ready()
             npred = pred_b.shape[1] - 1                        # frames after X_0
             t = int(torch.randint(1, npred + 1, (1,)).item()) # Δt ~ Uniform{1..npred}
