@@ -70,6 +70,9 @@ def main():
     p.add_argument('--dynamics-hierarchy', action='store_true',
                    help='Nested dynamics: train the operator on random slot-prefixes so the '
                         'latent can be evolved at reduced width (needs an ordered/slot_hierarchy AE)')
+    p.add_argument('--pixel-loss', type=float, default=None, metavar='W',
+                   help='Add a decoded pixel-space loss (weight W) through the frozen decoder '
+                        '(BPTT-free; overrides hyperparams pixel_loss_weight)')
     p.add_argument('--no-compile', action='store_true',
                    help='Disable torch.compile even if enabled in hyperparams.json')
     p.add_argument('--profile', type=int, default=0, metavar='N',
@@ -83,7 +86,10 @@ def main():
         cfg.evolve_state = True
     if args.dynamics_hierarchy:
         cfg.dynamics_hierarchy = True
-    print(f'evolve_state: {cfg.evolve_state}  dynamics_hierarchy: {cfg.dynamics_hierarchy}')
+    if args.pixel_loss is not None:
+        cfg.pixel_loss_weight = args.pixel_loss
+    print(f'evolve_state: {cfg.evolve_state}  dynamics_hierarchy: {cfg.dynamics_hierarchy}  '
+          f'pixel_loss_weight: {cfg.pixel_loss_weight}')
     n_epochs   = args.epochs or train_hp['n_epochs']
     batch_size = args.batch_size or train_hp['batch_size']
     num_workers  = args.num_workers if args.num_workers is not None else train_hp.get('num_workers', 4)

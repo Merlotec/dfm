@@ -79,6 +79,11 @@ class DFMConfig:
     ae_max_delta: int = 6     # AE pair (X_0, X_t): t sampled Uniform{1 .. ae_max_delta}
     evolve_state: bool = False    # also evolve the anchor-state embedding s_t in latent
     state_loss_weight: float = 1.0  # weight of the (teacher-forced) state-prediction loss
+    # Phase 2: decode one predicted latent per step through the *frozen* decoder and add a
+    # pixel-space reconstruction loss, so the dynamics is supervised on what actually shows up
+    # in the image (not just latent MSE).  Gradient flows into the dynamics; the decoder is not
+    # updated.  Still single-step teacher forcing → BPTT-free.  0 = off (pure latent MSE).
+    pixel_loss_weight: float = 0.0
 
     # --- ordered / nested slots (Matryoshka-style; variable token count at inference) ---
     # When on, the decoder reads the slots through a per-example monotone weight ramp

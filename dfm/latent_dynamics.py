@@ -180,6 +180,17 @@ class LatentDynamicsTrainer:
             ls = [self.ae.encode(x0, f, pixel_mask).detach() for f in context_frames]
         return torch.stack(ls, dim=1)                             # [B, F, K, d]
 
+    @staticmethod
+    def _pixel_loss(xhat: torch.Tensor, target: torch.Tensor,
+                    pixel_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """Masked MSE + L1 over valid pixels (first mask channel is is_valid)."""
+        if pixel_mask is not None:
+            m = pixel_mask[:, :1].expand_as(xhat).bool()
+            d = xhat[m] - target[m]
+        else:
+            d = xhat - target
+        return d.pow(2).mean() + 0.1 * d.abs().mean()
+
     def _state_key_bias(self, B: int, n_ctx: int, n: int, device) -> Optional[torch.Tensor]:
         """Training-time additive bias on the operator's cross-attn keys for the state
         hierarchy: 0 on the context keys, a sampled log-ramp on the state keys.  Returns
@@ -251,10 +262,22 @@ class LatentDynamicsTrainer:
                 sp = self.dynamics.evolve_state(s_in, ctx_rep, steps)          # s_t → s_{t+1}
                 state_loss = F.mse_loss(sp.float(), s_tgt.float())
                 loss = delta_loss + self.cfg.state_loss_weight * state_loss
+                pred_next = dp
             else:
                 state = self.dynamics.encode_state(x0, pixel_mask)             # fixed anchor s_0
                 pred  = self.dynamics(L_in, ctx_rep, state.repeat(n, 1, 1), steps, key_bias=kb)
                 loss  = F.mse_loss(pred.float(), L_tgt.float())
+                pred_next = pred
+
+            # optional pixel-space supervision: decode ONE predicted latent (random timestep)
+            # through the frozen decoder and add a reconstruction loss.  Gradient flows into the
+            # dynamics; the decoder is frozen and not updated.  Still single-step → BPTT-free.
+            if self.cfg.pixel_loss_weight > 0:
+                ti  = int(torch.randint(n, ()).item())
+                lat = pred_next[ti * B:(ti + 1) * B]                            # predicted L_{ti+1}
+                xhat = self.ae.decode(x0, lat, pixel_mask)                     # frozen decoder → dynamics
+                loss = loss + self.cfg.pixel_loss_weight * self._pixel_loss(
+                    xhat.float(), pred_frames[ti + 1], pixel_mask)
 
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()
