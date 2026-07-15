@@ -47,8 +47,14 @@ def denorm(frames: np.ndarray, mean: torch.Tensor, std: torch.Tensor) -> np.ndar
 
 
 def save_viewer_frames(gt_phys: np.ndarray, pred_phys: np.ndarray,
-                       timestamps: list, n_context: int, run_name: str, viewer_dir: Path):
-    """Write t_*.npz files in the format expected by fvm_viewer/viewer.py -c."""
+                       timestamps: list, n_context: int, run_name: str, viewer_dir: Path,
+                       shards: list | None = None):
+    """Write t_*.npz files in the format expected by fvm_viewer/viewer.py -c.
+
+    ``shards`` (optional) is a per-frame list aligned with ``timestamps``; each entry
+    is either None or a dict {'xy': [M,2] float, 'act': [M] float} of shard pixel
+    positions and their active(1)→shadow(0) gate, saved as extra npz keys so the
+    viewer can show the adaptive-discretisation cloud beside the fluid state."""
     run_dir = viewer_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     for i, ts in enumerate(timestamps):
@@ -56,8 +62,12 @@ def save_viewer_frames(gt_phys: np.ndarray, pred_phys: np.ndarray,
             grid, is_seed = gt_phys[i].astype(np.float32), True
         else:
             grid, is_seed = pred_phys[i - n_context].astype(np.float32), False
+        extra = {}
+        if shards is not None and shards[i] is not None:
+            extra['shard_xy']  = shards[i]['xy'].astype(np.float32)
+            extra['shard_act'] = shards[i]['act'].astype(np.float32)
         np.savez(run_dir / f't_{ts:.4g}.npz',
-                 grid=grid, t=np.float32(ts), is_seed=np.bool_(is_seed))
+                 grid=grid, t=np.float32(ts), is_seed=np.bool_(is_seed), **extra)
     print(f'  Saved {len(timestamps)} viewer frames → {run_dir}')
 
 

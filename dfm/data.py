@@ -20,7 +20,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, DistributedSampler
 
 # ---- inject solver path so MeshRenderer is importable ----
 _FLSIM_ROOT = Path(__file__).resolve().parents[2]  # .../flsim
@@ -168,7 +168,7 @@ def compute_normalisation_stats(
     sim_dirs: list[Path],
     renderer: MeshRenderer,
     n_samples: int = 300,
-    first_frame: int = 20,
+    first_frame: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Estimate per-channel mean and std by sampling frames across all runs."""
     all_files: list[Path] = []
@@ -195,6 +195,39 @@ def compute_normalisation_stats(
             s1[c]  += fin.sum()
             s2[c]  += (fin ** 2).sum()
             cnt[c] += fin.numel()
+
+    mean = s1 / cnt
+    std  = ((s2 / cnt) - mean ** 2).clamp(min=0).sqrt().clamp(min=1e-6)
+    return mean, std
+
+
+def compute_normalisation_stats_groups(
+    groups: list[tuple],                 # [(renderer, sim_dirs)] — one per geometry
+    n_samples: int = 300,
+    first_frame: int = 20,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean/std over frames sampled across ALL geometries, each rendered by its own
+    renderer.  Divides the sample budget across groups so no single mesh dominates."""
+    C = 4
+    s1, s2, cnt = torch.zeros(C), torch.zeros(C), torch.zeros(C)
+    per_group = max(1, n_samples // max(1, len(groups)))
+    for renderer, sim_dirs in groups:
+        files: list[Path] = []
+        for d in sim_dirs:
+            files.extend(sorted(
+                [f for f in d.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
+                key=lambda f: float(f.stem[2:]),
+            )[first_frame:])
+        if not files:
+            continue
+        n = min(per_group, len(files))
+        for i in torch.randperm(len(files))[:n].tolist():
+            d = np.load(files[i])
+            vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
+            frame = renderer.render_cell_smooth(vals)
+            for c in range(C):
+                fin = frame[c][torch.isfinite(frame[c])]
+                s1[c]  += fin.sum();  s2[c] += (fin ** 2).sum();  cnt[c] += fin.numel()
 
     mean = s1 / cnt
     std  = ((s2 / cnt) - mean ** 2).clamp(min=0).sqrt().clamp(min=1e-6)
@@ -231,9 +264,10 @@ class FVMSequenceDataset(Dataset):
         pred_len:       int,
         mean:           torch.Tensor,
         std:            torch.Tensor,
-        first_frame:    int = 20,
+        first_frame:    int = 0,
         frame_cache:    Optional[list[torch.Tensor]] = None,
         random_context: bool = True,
+        pixel_mask:     Optional[torch.Tensor] = None,
     ):
         files = sorted(
             [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
@@ -247,6 +281,9 @@ class FVMSequenceDataset(Dataset):
         self.mean           = mean.view(-1, 1, 1)   # [C, 1, 1] for broadcasting
         self.std            = std.view(-1, 1, 1)
         self._cache         = frame_cache            # optional pre-rendered cache
+        # this run's fluid mask [1, H, W] (its collider geometry).  When set, every
+        # item carries it so a batch mixing different meshes can be masked per-sample.
+        self.pixel_mask     = pixel_mask
 
     def __len__(self) -> int:
         # Need enough frames for both a prediction window and a context block.
@@ -264,6 +301,8 @@ class FVMSequenceDataset(Dataset):
             c_start = 0
         context = torch.stack([self._get_frame(c_start + i) for i in range(self.n_context)])
 
+        if self.pixel_mask is not None:
+            return context, pred, self.pixel_mask   # + [1, H, W] fluid mask for this run
         return context, pred   # [n_context, C, H, W], [pred_len, C, H, W]
 
     def _get_frame(self, i: int) -> torch.Tensor:
@@ -278,8 +317,9 @@ class FVMSequenceDataset(Dataset):
     def with_cache(cls, sim_dir: Path, renderer: MeshRenderer,
                    n_context: int, pred_len: int,
                    mean: torch.Tensor, std: torch.Tensor,
-                   first_frame: int = 20,
-                   random_context: bool = True) -> "FVMSequenceDataset":
+                   first_frame: int = 0,
+                   random_context: bool = True,
+                   pixel_mask: Optional[torch.Tensor] = None) -> "FVMSequenceDataset":
         """Pre-render and cache all frames in memory for fast repeated access."""
         files = sorted(
             [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
@@ -294,7 +334,8 @@ class FVMSequenceDataset(Dataset):
             raw  = renderer.render_cell_smooth(vals)
             cache.append((raw - m) / s)
         return cls(sim_dir, renderer, n_context, pred_len, mean, std,
-                   first_frame, frame_cache=cache, random_context=random_context)
+                   first_frame, frame_cache=cache, random_context=random_context,
+                   pixel_mask=pixel_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -339,10 +380,11 @@ class FVMDataModule:
         resolution:  tuple[int, int] = (256, 256),
         batch_size:  int = 4,
         num_workers: int = 4,
-        first_frame: int = 20,
+        first_frame: int = 0,       # include all frames from the start of the sim
         cache_frames: bool = False,
         random_context: bool = True,
         return_index: bool = False,
+        return_mask: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
     ):
@@ -357,24 +399,49 @@ class FVMDataModule:
         self.cache_frames   = cache_frames
         self.random_context = random_context
         self.return_index   = return_index         # yield (idx, context, pred) for latent caching
+        self.return_mask    = return_mask          # each item carries its run's fluid mask
         self._dataset: Optional[ConcatDataset] = None
         self.mean: Optional[torch.Tensor] = mean
         self.std:  Optional[torch.Tensor] = std
 
-    def setup(self, recompute_stats: bool = False):
-        renderer = build_renderer(self.data_dir, self.resolution)
-
-        # A simulation directory is any subdirectory containing frame files
-        # (t_*.npz).  This is robust to run-naming conventions (run*, mu_b_*, …).
-        sim_dirs = sorted(
-            p for p in self.data_dir.iterdir()
+    @staticmethod
+    def _sim_dirs(root: Path) -> list[Path]:
+        """Immediate subdirectories of `root` that hold frame files (t_*.npz)."""
+        return sorted(
+            p for p in root.iterdir()
             if p.is_dir() and not p.name.startswith('.')
             and any(f.name.startswith('t_') and f.name.endswith('.npz') for f in p.iterdir())
         )
-        if not sim_dirs:
-            raise RuntimeError(f'No simulation subdirectories found in {self.data_dir}')
 
-        # Load or compute normalisation stats (skip if already provided externally)
+    def _mesh_groups(self) -> list[tuple]:
+        """Group runs by collider geometry.  Returns [(renderer, pixel_mask, sim_dirs)].
+
+        Flat layout: shared_mesh.pkl at data_dir root, runs as immediate subdirs (one
+        group).  Multi-mesh layout (from run_gen.py with n_meshes>1): mesh_*/ subdirs,
+        each with its own shared_mesh.pkl + runs — one group per geometry, each with
+        its own renderer and fluid mask."""
+        def group(root: Path):
+            r = build_renderer(root, self.resolution)
+            m = load_pixel_mask(root, r, self.resolution)[0] if self.return_mask else None  # [1,H,W]
+            return (r, m, self._sim_dirs(root))
+
+        if (self.data_dir / 'shared_mesh.pkl').exists():
+            return [group(self.data_dir)]
+        groups = []
+        for md in sorted(p for p in self.data_dir.iterdir() if p.is_dir()):
+            if (md / 'shared_mesh.pkl').exists():
+                g = group(md)
+                if g[2]:
+                    groups.append(g)
+        if not groups:
+            raise RuntimeError(
+                f'No shared_mesh.pkl found in {self.data_dir} or its mesh_*/ subdirs')
+        return groups
+
+    def setup(self, recompute_stats: bool = False):
+        groups = self._mesh_groups()          # [(renderer, mask, sim_dirs)] per geometry
+
+        # Normalisation stats: sampled across ALL runs, each rendered by its own mesh.
         if self.mean is None or self.std is None:
             stats_path = self.data_dir / self.STATS_FILE
             if stats_path.exists() and not recompute_stats:
@@ -384,8 +451,8 @@ class FVMDataModule:
                 self.std  = torch.tensor(s['std'])
             else:
                 print('Computing normalisation stats...')
-                self.mean, self.std = compute_normalisation_stats(
-                    sim_dirs, renderer, first_frame=self.first_frame)
+                self.mean, self.std = compute_normalisation_stats_groups(
+                    [(r, sims) for r, _m, sims in groups], first_frame=self.first_frame)
                 with open(stats_path, 'w') as f:
                     json.dump({'mean': self.mean.tolist(), 'std': self.std.tolist()}, f)
                 print(f'Stats saved to {stats_path}')
@@ -395,14 +462,15 @@ class FVMDataModule:
         )
         datasets = [
             builder(d, renderer, self.n_context, self.pred_len, self.mean, self.std,
-                    self.first_frame, random_context=self.random_context)
-            for d in sim_dirs
+                    self.first_frame, random_context=self.random_context, pixel_mask=pmask)
+            for renderer, pmask, sim_dirs in groups for d in sim_dirs
         ]
         datasets = [ds for ds in datasets if len(ds) > 0]
         if not datasets:
             raise RuntimeError('No usable sequences found — try reducing horizon or first_frame')
         self._dataset = ConcatDataset(datasets)
-        print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} runs')
+        print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} runs '
+              f'/ {len(groups)} mesh(es)')
 
     def _num_workers(self) -> int:
         # When frames are cached in RAM, __getitem__ is a cheap index+normalise,
@@ -417,10 +485,20 @@ class FVMDataModule:
     def train_dataloader(self) -> DataLoader:
         assert self._dataset is not None, 'Call setup() first'
         w = self._num_workers()
+        ds = self._wrap(self._dataset)
+        # Multi-process training: shard the dataset across ranks (without this,
+        # every rank would draw its own random batches from the FULL dataset and
+        # gradient averaging would mostly duplicate work).  The train loop should
+        # call .sampler.set_epoch(e) each epoch to reshuffle.
+        sampler = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized() \
+                and torch.distributed.get_world_size() > 1:
+            sampler = DistributedSampler(ds, shuffle=True, drop_last=True)
         return DataLoader(
-            self._wrap(self._dataset),
+            ds,
             batch_size         = self.batch_size,
-            shuffle            = True,
+            shuffle            = sampler is None,
+            sampler            = sampler,
             num_workers        = w,
             pin_memory         = True,
             persistent_workers = w > 0,
