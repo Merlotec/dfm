@@ -180,6 +180,12 @@ class AutoencoderTrainer:
             self.norm_std  = self.norm_std.to(device)
         return self
 
+    def wrap_ddp(self, device: torch.device):
+        from dfm.distributed import wrap_ddp
+        self.ae            = wrap_ddp(self.ae, device, find_unused_parameters=True)
+        self.discriminator = wrap_ddp(self.discriminator, device, find_unused_parameters=True)
+
+
     def _advance(self):
         self.scheduler.step()
         self.global_step += 1

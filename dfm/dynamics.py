@@ -57,6 +57,10 @@ class RolloutTrainer:
         self.criterion = self.criterion.to(device)
         return self
 
+    def wrap_ddp(self, device: torch.device):
+        from dfm.distributed import wrap_ddp
+        self.evo = wrap_ddp(self.evo, device, find_unused_parameters=True)
+
     def load_ae(self, path: str):
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
         self.ae.load_state_dict(ckpt['ae'], strict=False)

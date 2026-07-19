@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dfm import DFMConfig, AutoencoderTrainer
 from dfm.data import FVMDataModule, build_renderer, load_pixel_mask
 from dfm.profiling import LoopProfiler, make_profiler, finish_profiler
+from dfm.distributed import init_distributed, is_main, allreduce_stats
 
 _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'
@@ -46,11 +47,9 @@ def load_config() -> tuple[DFMConfig, dict]:
 
 
 def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    if torch.backends.mps.is_available():
-        return torch.device('mps')
-    return torch.device('cpu')
+    from dfm.distributed import pick_device
+    return pick_device()
+
 
 
 def main():
@@ -69,8 +68,9 @@ def main():
                    help='Profile the first N steps with torch.profiler, print a kernel breakdown, then exit')
     args = p.parse_args()
 
-    device = get_device()
-    print(f'Device: {device}')
+    rank, world, local_rank, device = init_distributed()
+    if is_main():
+        print(f'Device: {device}')
     cfg, train_hp = load_config()
     n_epochs   = args.epochs or train_hp['n_epochs']
     batch_size = args.batch_size or train_hp['batch_size']
@@ -115,8 +115,10 @@ def main():
         cands = sorted(CKPT_DIR.glob('ae_*.pt'))
         args.resume = str(cands[-1]) if cands else None
     if args.resume:
-        print(f'Resuming from {args.resume}')
+        if is_main(): print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
+
+    trainer.wrap_ddp(device)
 
     # --- CUDA throughput: TF32 + torch.compile ---
     if device.type == 'cuda':
@@ -137,10 +139,12 @@ def main():
     print(f'Dataset:       {len(dm._dataset)} sequences  (ae_max_delta={cfg.ae_max_delta})')
     print(f'Curriculum:    GAN activates at step {GAN_START_STEP}\n')
 
-    log = open(CKPT_DIR / 'ae_loss_log.csv', 'a', newline='')
-    w = csv.writer(log)
-    if (CKPT_DIR / 'ae_loss_log.csv').stat().st_size == 0:
-        w.writerow(['epoch', 'train_recon', 'val_recon']); log.flush()
+    log = None
+    if is_main():
+        log = open(CKPT_DIR / 'ae_loss_log.csv', 'a', newline='')
+        w = csv.writer(log)
+        if (CKPT_DIR / 'ae_loss_log.csv').stat().st_size == 0:
+            w.writerow(['epoch', 'train_recon', 'val_recon']); log.flush()
 
     prof  = LoopProfiler(device)
     tprof = make_profiler(args.profile > 0, device)
@@ -175,19 +179,26 @@ def main():
                 print(f'epoch {epoch:3d}  step {step:6d} | recon={recon:.4f}  '
                       f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}  |  {prof.line()}')
 
-        train_recon = rsum / rcnt if rcnt else float('nan')
+        train_r = rsum / rcnt if rcnt else float('nan')
         if val_dl is None:
-            val_recon = float('nan')
+            val_r = float('nan')
         elif cfg.warp_incremental:
-            val_recon = trainer.validate_seq(val_dl, pixel_mask=val_pm)
+            val_r = trainer.validate_seq(val_dl, pixel_mask=val_pm)
         else:
-            val_recon = trainer.validate(val_dl, pixel_mask=val_pm)
-        print(f'  [epoch {epoch:3d}] train_recon={train_recon:.4f}  val_recon={val_recon:.4f}')
-        w.writerow([epoch, f'{train_recon:.6f}', f'{val_recon:.6f}']); log.flush()
-        if (epoch + 1) % 2 == 0:
-            path = CKPT_DIR / f'ae_epoch{epoch:03d}.pt'
-            trainer.save(str(path)); print(f'  [ckpt] {path.name}')
-    log.close()
+            val_r = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')
+        train_r, val_r = allreduce_stats(train_r, val_r)
+        train_r /= world
+        val_r /= world
+
+        if is_main():
+            print(f'  [epoch {epoch:3d}] train_recon={train_r:.5f}  val_recon={val_r:.5f}')
+            w.writerow([epoch, f'{train_r:.6f}', f'{val_r:.6f}']); log.flush()
+            if (epoch + 1) % 2 == 0:
+                path = CKPT_DIR / f'ae_epoch{epoch:03d}.pt'
+                trainer.save(str(path)); print(f'  [ckpt] {path.name}')
+    
+    if is_main() and log is not None:
+        log.close()
 
 
 if __name__ == '__main__':

@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dfm import DFMConfig, RolloutTrainer
 from dfm.data import FVMDataModule, build_renderer, load_pixel_mask
 from dfm.profiling import LoopProfiler, make_profiler, finish_profiler
+from dfm.distributed import init_distributed, is_main, allreduce_stats
 
 _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'
@@ -41,11 +42,9 @@ def load_config() -> tuple[DFMConfig, dict]:
 
 
 def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    if torch.backends.mps.is_available():
-        return torch.device('mps')
-    return torch.device('cpu')
+    from dfm.distributed import pick_device
+    return pick_device()
+
 
 
 def main():
@@ -65,8 +64,9 @@ def main():
                    help='Profile the first N steps with torch.profiler, print a kernel breakdown, then exit')
     args = p.parse_args()
 
-    device = get_device()
-    print(f'Device: {device}')
+    rank, world, local_rank, device = init_distributed()
+    if is_main():
+        print(f'Device: {device}')
     cfg, train_hp = load_config()
     n_epochs   = args.epochs or train_hp['n_epochs']
     batch_size = args.batch_size or train_hp['batch_size']
@@ -109,8 +109,10 @@ def main():
         cands = sorted(CKPT_DIR.glob('dyn_*.pt'))
         args.resume = str(cands[-1]) if cands else None
     if args.resume:
-        print(f'Resuming from {args.resume}')
+        if is_main(): print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
+
+    trainer.wrap_ddp(device)
 
     # --- CUDA throughput: TF32 + torch.compile (kernel fusion) ---
     if device.type == 'cuda':
@@ -126,10 +128,12 @@ def main():
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:        {len(dm._dataset)} sequences\n')
 
-    log = open(CKPT_DIR / 'dyn_loss_log.csv', 'a', newline='')
-    w = csv.writer(log)
-    if (CKPT_DIR / 'dyn_loss_log.csv').stat().st_size == 0:
-        w.writerow(['epoch', 'train_field_loss', 'train_latent_loss', 'val_field_loss']); log.flush()
+    log = None
+    if is_main():
+        log = open(CKPT_DIR / 'dyn_loss_log.csv', 'a', newline='')
+        w = csv.writer(log)
+        if (CKPT_DIR / 'dyn_loss_log.csv').stat().st_size == 0:
+            w.writerow(['epoch', 'train_field_loss', 'train_latent_loss', 'val_field_loss']); log.flush()
 
     prof  = LoopProfiler(device)
     tprof = make_profiler(args.profile > 0, device)
@@ -153,12 +157,21 @@ def main():
         train_f = fsum / count if count else float('nan')
         train_l = lsum / count if count else float('nan')
         val_f = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')
-        print(f'  [epoch {epoch:3d}] train_field={train_f:.5f} train_latent={train_l:.5f}  val_field={val_f:.5f}')
-        w.writerow([epoch, f'{train_f:.6f}', f'{train_l:.6f}', f'{val_f:.6f}']); log.flush()
-        if (epoch + 1) % 2 == 0:
-            path = CKPT_DIR / f'dyn_epoch{epoch:03d}.pt'
-            trainer.save(str(path)); print(f'  [ckpt] {path.name}')
-    log.close()
+
+        train_f, train_l, val_f = allreduce_stats(train_f, train_l, val_f)
+        train_f /= world
+        train_l /= world
+        val_f /= world
+
+        if is_main():
+            print(f'  [epoch {epoch:3d}] train_field={train_f:.5f} train_latent={train_l:.5f}  val_field={val_f:.5f}')
+            w.writerow([epoch, f'{train_f:.6f}', f'{train_l:.6f}', f'{val_f:.6f}']); log.flush()
+            if (epoch + 1) % 2 == 0:
+                path = CKPT_DIR / f'dyn_epoch{epoch:03d}.pt'
+                trainer.save(str(path)); print(f'  [ckpt] {path.name}')
+    
+    if is_main() and log is not None:
+        log.close()
 
 
 if __name__ == '__main__':
