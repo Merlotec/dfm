@@ -87,8 +87,18 @@ def main():
     assert dm._dataset is not None
     steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
     total_steps     = steps_per_epoch * n_epochs
-    renderer   = build_renderer(args.data, cfg.img_hw)
-    pixel_mask = load_pixel_mask(args.data, renderer, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
+    mesh_dirs = []
+    if (args.data / 'shared_mesh.pkl').exists():
+        mesh_dirs.append(args.data)
+    else:
+        for p in args.data.iterdir():
+            if p.is_dir() and (p / 'shared_mesh.pkl').exists():
+                mesh_dirs.append(p)
+    if not mesh_dirs:
+        raise RuntimeError(f'No shared_mesh.pkl found in {args.data} or its subdirectories')
+
+    renderer   = build_renderer(mesh_dirs[0], cfg.img_hw)
+    pixel_mask = load_pixel_mask(mesh_dirs[0], renderer, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
 
     val_dl = val_pm = None
     if args.test_data.exists():
@@ -99,8 +109,16 @@ def main():
                             cache_frames=cache_frames, random_context=False,
                             mean=dm.mean, std=dm.std)
         vdm.setup()
-        vr = build_renderer(args.test_data, cfg.img_hw)
-        val_pm = load_pixel_mask(args.test_data, vr, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
+        v_mesh_dirs = []
+        if (args.test_data / 'shared_mesh.pkl').exists():
+            v_mesh_dirs.append(args.test_data)
+        else:
+            for p in args.test_data.iterdir():
+                if p.is_dir() and (p / 'shared_mesh.pkl').exists():
+                    v_mesh_dirs.append(p)
+        
+        vr = build_renderer(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, cfg.img_hw)
+        val_pm = load_pixel_mask(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, vr, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
         val_dl = vdm.val_dataloader()
 
     trainer = AutoencoderTrainer(
