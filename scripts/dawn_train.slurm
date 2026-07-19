@@ -8,7 +8,7 @@
 # and configures DDP for oneCCL backend on XPU.
 #
 # ---------------------------------------------------------------------------
-#SBATCH --job-name=hfm-dawn
+#SBATCH --job-name=dfm-dawn
 #SBATCH --account=AIRR-P67-DAWN-GPU
 #SBATCH --partition=pvc9                    # Dawn PVC (Max 1550) partition
 #SBATCH --nodes=1
@@ -23,8 +23,8 @@
 # the layout oneCCL's topology code expects, and 8 tiles > the 4 x 1-tile
 # spread this replaced.  Before going multi-node again, point FI_PROVIDER_PATH
 # at a system libfabric with a real fabric provider (see dawn_task.sh).
-#SBATCH --output=logs/hfm_dawn.out
-#SBATCH --error=logs/hfm_dawn.err
+#SBATCH --output=logs/dfm_dawn.out
+#SBATCH --error=logs/dfm_dawn.err
 #SBATCH --export=NONE                       # Do not export loaded modules from the submission shell
 
 set -euo pipefail

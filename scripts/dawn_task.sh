@@ -144,7 +144,7 @@ fi
 # NOTE: we do NOT use Lightning on Dawn.  Lightning's accelerator registry is
 # {cpu, cuda, mps, tpu} — there is no XPU accelerator — so accelerator='auto'
 # silently falls back to CPU on a PVC node (and 'bf16-true' then dies on a
-# fp32-input/bf16-weight mismatch).  scripts/train.py uses raw torch DDP via
+# fp32-input/bf16-weight mismatch).  scripts/train_ae.py uses raw torch DDP via
 # hfm/distributed.py, which selects xpu:<SLURM_LOCALID> and uses the native
 # 'xccl' backend (torch>=2.7) or oneCCL 'ccl'.  Rank/size come from SLURM_* vars.
 cd "$SLURM_SUBMIT_DIR"
