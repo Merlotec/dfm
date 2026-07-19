@@ -150,6 +150,8 @@ def wrap_ddp(module: torch.nn.Module, device: torch.device,
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return module
+    if host_grad_sync_enabled():
+        return module
     if device.type == 'cuda':
         return torch.nn.parallel.DistributedDataParallel(
             module, device_ids=[device.index], output_device=device.index,

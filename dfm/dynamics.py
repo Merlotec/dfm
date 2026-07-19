@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from dfm.distributed import host_grad_sync_enabled, allreduce_grads, allreduce_stats
 
 from .autoencoder import LatentAutoencoder
 from .config import DFMConfig
@@ -107,11 +108,14 @@ class RolloutTrainer:
         self.opt.zero_grad()
         field, latent, _ = self._rollout(frames, pixel_mask, K, training=True)
         loss = field + cfg.latent_loss_weight * latent
-        if not torch.isfinite(loss):
+        (bad,) = allreduce_stats(0.0 if torch.isfinite(loss) else 1.0)
+        if bad > 0.0:
             self.opt.zero_grad()
             self._advance()
             return float('nan'), float('nan')
         loss.backward()
+        if host_grad_sync_enabled():
+            allreduce_grads([self.evo])
         if self.clip_grad > 0:
             nn.utils.clip_grad_norm_(self.evo.parameters(), self.clip_grad)
         self.opt.step()

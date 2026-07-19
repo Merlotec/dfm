@@ -19,8 +19,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.functional as F
 from einops import rearrange
-from typing import Optional, Tuple
+from typing import Optional, List, Tuple
+from dfm.distributed import host_grad_sync_enabled, allreduce_grads, allreduce_stats
 
 from .config import DFMConfig
 from .modules import (PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SelfAttnBlock,
@@ -312,9 +314,12 @@ class AutoencoderTrainer:
                 p.requires_grad_(True)
 
         if adv_weight == 0.0:
-            if not torch.isfinite(loss):
+            (bad,) = allreduce_stats(0.0 if torch.isfinite(loss) else 1.0)
+            if bad > 0.0:
                 _restore(); self._advance(); return float('nan'), 0.0
             loss.backward()
+            if host_grad_sync_enabled():
+                allreduce_grads([self.ae])
             if self.clip_grad > 0:
                 nn.utils.clip_grad_norm_(self.ae.parameters(), self.clip_grad)
             self.gen_optimizer.step()
@@ -332,11 +337,14 @@ class AutoencoderTrainer:
                   F.binary_cross_entropy_with_logits(fake_logit,
                                                      torch.zeros_like(fake_logit)))
         d_val = d_loss.item()
-        if not math.isfinite(d_val):
+        (bad_d,) = allreduce_stats(0.0 if math.isfinite(d_val) else 1.0)
+        if bad_d > 0.0:
             _restore(); self._advance(); return float('nan'), float('nan')
         disc_healthy = self.disc_update_threshold < d_val < 2.0
         if disc_healthy:
             d_loss.backward()
+            if host_grad_sync_enabled():
+                allreduce_grads([self.discriminator])
             if self.clip_grad > 0:
                 nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.clip_grad)
             self.disc_optimizer.step()
@@ -350,9 +358,12 @@ class AutoencoderTrainer:
             adv = F.binary_cross_entropy_with_logits(adv_logit,
                                                      torch.ones_like(adv_logit))
             loss = loss + adv_weight * adv
-        if not torch.isfinite(loss):
+        (bad_g,) = allreduce_stats(0.0 if torch.isfinite(loss) else 1.0)
+        if bad_g > 0.0:
             _restore(); self._advance(); return float('nan'), d_val
         loss.backward()
+        if host_grad_sync_enabled():
+            allreduce_grads([self.ae])
         if self.clip_grad > 0:
             nn.utils.clip_grad_norm_(self.ae.parameters(), self.clip_grad)
         self.gen_optimizer.step()
