@@ -1,99 +1,70 @@
 {
-  "_comment": "DFM latent-rollout fluid model hyperparameters (lightweight).",
-
+  "_comment": "DFM \u2014 convection + generative closure (two-part warp model). See dfm/config.py for design rationale.",
   "model": {
     "img_size": 256,
-    "in_channels": 4,
     "patch_px": 16,
-
+    "in_channels": 4,
+    "n_mask_ch": 1,
     "d_model": 384,
     "n_slots": 128,
+    "n_detail_slots": 16,
     "n_heads": 8,
-
-    "n_enc_layers": 3,
-    "local_attn_radius": 1,
-
-    "n_evo_layers": 4,
-    "integrator": "rk2",
-    "max_rollout": 64,
-    "reencode_every": 2,
-    "reencode_every_min": 1,
-    "reencode_every_max": 5,
-
-    "n_dec_layers": 3,
-    "skip_ch": 32,
-
-    "slot_hierarchy": true,
-    "slot_full_prob": 0.25,
-    "slot_cutoff_min": 1.0,
-    "n_slot_layers": 2,
-    "dynamics_hierarchy": true,
-    "state_hierarchy": true,
-
-    "latent_noise_std": 0.1,
-    "ae_decode_noise_std": 0.05,
-    "pixel_loss_weight": 0.2,
-
-    "horizon": 4,
-    "horizon_min": 2,
-    "horizon_max": 6,
-    "horizon_gamma": 1.0,
-
     "mlp_ratio": 4.0,
-    "ae_mlp_ratio": 2.0,
+    "ae_mlp": 4.0,
     "dropout": 0.0,
-
-    "n_context_frames": 5,
-    "ctx_patch_px": 16,
-    "d_ctx": 384,
-    "n_ctx_tokens": 64,
-    "n_ctx_layers": 4,
-    "n_ctx_heads": 8,
-
-    "disc_dim": 384,
-    "disc_adv_weight": 0.1,
-    "disc_lr": 1e-4,
-
-    "_warp": "warp decoder: latent-determined transport map (move+reweight) applied to X_0; no network reads X_0. Flip warp_decoder to true to enable.",
-    "warp_decoder": false,
+    "n_enc_layers": 3,
+    "n_slot_layers": 2,
+    "local_attn_radius": 1,
     "warp_map_res": 32,
-    "warp_max_disp": 0.25,
-    "warp_gain_range": 4.0,
+    "warp_max_disp": 0.06,
+    "warp_gain_range": 0.5,
     "warp_divfree": true,
     "warp_head_layers": 2,
-
-    "_warp_learn": "flow-over-generation aids: incremental composition (per-step maps, composed), annealed velocity-supervised flow aux, gain freeze curriculum + conservation prior.",
-    "warp_incremental": false,
-    "warp_inc_max_disp": 0.06,
-    "warp_inc_gain_range": 0.5,
-    "warp_flow_aux_weight": 0.1,
-    "warp_flow_aux_steps": 5000,
-    "warp_gain_freeze_steps": 2000,
-    "warp_gain_l1": 0.01,
-
-    "_warp_two_part": "convection + generative closure: transport/detail slot split, staged (boosting-style) training, residual-gated complexity loss.",
-    "n_detail_slots": 0,
     "warp_detail_res": 64,
     "warp_detail_range": 1.0,
     "warp_stage_a_steps": 8000,
-    "warp_complexity_gate": false,
+    "warp_flow_aux_weight": 0.1,
+    "warp_flow_aux_steps": 5000,
+    "warp_vel_channels": [
+      0,
+      1
+    ],
+    "_alpha": "\u03b1_axis \u2248 \u0394t_frame / half-domain-extent; sign encodes render orientation \u2014 set from solver metadata",
+    "warp_flow_alpha": [
+      0.01,
+      0.01
+    ],
+    "warp_flow_alpha_learnable": false,
+    "warp_gain_freeze_steps": 2000,
+    "warp_gain_l1": 0.01,
+    "warp_complexity_gate": true,
     "warp_gate_lambda_d": 1.0,
     "warp_gate_lambda_g": 0.0,
     "warp_gate_window": 8,
-    "warp_gate_anneal_steps": 0
+    "warp_gate_anneal_steps": 0,
+    "ae_decode_noise_std": 0.05,
+    "n_evo_layers": 4,
+    "integrator": "rk2",
+    "max_rollout": 64,
+    "horizon": 4,
+    "horizon_min": 2,
+    "horizon_max": 6,
+    "latent_loss_weight": 1.0,
+    "ae_max_delta": 8,
+    "n_context_frames": 5,
+    "frame_mask": true,
+    "warp_incremental": true,
+    "disc_dim": 128,
+    "disc_adv_weight": 0.05
   },
-
   "training": {
     "batch_size": 64,
     "n_epochs": 1000,
-
-    "lr": 1e-4,
-    "weight_decay": 1e-5,
+    "lr": 0.0001,
+    "weight_decay": 1e-05,
     "clip_grad": 1.0,
-
     "l1_weight": 0.1,
     "latent_loss_weight": 0.1,
-
     "num_workers": 10,
     "cache_frames": false,
     "compile": true

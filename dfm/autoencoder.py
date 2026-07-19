@@ -337,10 +337,16 @@ class AutoencoderTrainer:
                   F.binary_cross_entropy_with_logits(fake_logit,
                                                      torch.zeros_like(fake_logit)))
         d_val = d_loss.item()
-        (bad_d,) = allreduce_stats(0.0 if math.isfinite(d_val) else 1.0)
+        # The health gate must be decided on the GLOBAL mean disc loss: gating on
+        # the local value lets ranks branch differently around the disc backward /
+        # allreduce_grads below, which desyncs the collective schedule and hangs
+        # the whole group (this exact bug hung HFM's port until globalized there).
+        finite = math.isfinite(d_val)
+        n, d_sum, bad_d = allreduce_stats(1.0, d_val if finite else 0.0,
+                                          0.0 if finite else 1.0)
         if bad_d > 0.0:
             _restore(); self._advance(); return float('nan'), float('nan')
-        disc_healthy = self.disc_update_threshold < d_val < 2.0
+        disc_healthy = self.disc_update_threshold < (d_sum / n) < 2.0
         if disc_healthy:
             d_loss.backward()
             if host_grad_sync_enabled():
