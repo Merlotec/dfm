@@ -9,6 +9,7 @@ The renderer (MeshRenderer) converts FVM cell-level primitives to a smooth
 pixel grid via barycentric interpolation.  It is built once per dataset and
 cached to disk alongside the data as renderer_cache_{H}x{W}.pt.
 """
+from __future__ import annotations
 
 import json
 import os

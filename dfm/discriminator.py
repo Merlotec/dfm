@@ -17,9 +17,12 @@ from .config import DFMConfig
 class DFMDiscriminator(nn.Module):
     """
     frame   : [B, C, H, W]     frame being judged (model output or ground truth)
-    x_prev  : [B, C, H, W]     ground-truth previous frame
-    context : [B, K, d_ctx]    context tokens
+    x_prev  : [B, C, H, W]     conditioning frame (X_0)
     returns : [B, 1]           real/fake logit (use BCEWithLogitsLoss)
+
+    Stage-B closure GAN: the sub-resolution residual is distributional (fitting
+    chaos with L2 predicts the conditional mean, i.e. blur), so it is judged
+    adversarially — while the transport stays pure L2.
     """
 
     def __init__(self, cfg: DFMConfig):
@@ -40,10 +43,9 @@ class DFMDiscriminator(nn.Module):
         self.conv      = nn.Sequential(*layers)
         self.pool      = nn.AdaptiveAvgPool2d(1)
         self.conv_proj = spectral_norm(nn.Linear(512, d))
-        self.ctx_proj  = spectral_norm(nn.Linear(cfg.d_ctx, d))
 
         self.head = nn.Sequential(
-            spectral_norm(nn.Linear(d * 2, d * 2)),
+            spectral_norm(nn.Linear(d, d * 2)),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
             spectral_norm(nn.Linear(d * 2, d)),
@@ -60,9 +62,7 @@ class DFMDiscriminator(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, frame: torch.Tensor, x_prev: torch.Tensor,
-                context: torch.Tensor) -> torch.Tensor:
+    def forward(self, frame: torch.Tensor, x_prev: torch.Tensor) -> torch.Tensor:
         x = torch.cat([x_prev, frame], dim=1)                 # [B, 2C, H, W]
         conv_vec = self.conv_proj(self.pool(self.conv(x)).flatten(1))
-        ctx_vec  = self.ctx_proj(context.mean(dim=1))
-        return self.head(torch.cat([conv_vec, ctx_vec], dim=-1))
+        return self.head(conv_vec)

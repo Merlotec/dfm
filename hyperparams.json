@@ -52,7 +52,35 @@
 
     "disc_dim": 384,
     "disc_adv_weight": 0.1,
-    "disc_lr": 1e-4
+    "disc_lr": 1e-4,
+
+    "_warp": "warp decoder: latent-determined transport map (move+reweight) applied to X_0; no network reads X_0. Flip warp_decoder to true to enable.",
+    "warp_decoder": false,
+    "warp_map_res": 32,
+    "warp_max_disp": 0.25,
+    "warp_gain_range": 4.0,
+    "warp_divfree": true,
+    "warp_head_layers": 2,
+
+    "_warp_learn": "flow-over-generation aids: incremental composition (per-step maps, composed), annealed velocity-supervised flow aux, gain freeze curriculum + conservation prior.",
+    "warp_incremental": false,
+    "warp_inc_max_disp": 0.06,
+    "warp_inc_gain_range": 0.5,
+    "warp_flow_aux_weight": 0.1,
+    "warp_flow_aux_steps": 5000,
+    "warp_gain_freeze_steps": 2000,
+    "warp_gain_l1": 0.01,
+
+    "_warp_two_part": "convection + generative closure: transport/detail slot split, staged (boosting-style) training, residual-gated complexity loss.",
+    "n_detail_slots": 0,
+    "warp_detail_res": 64,
+    "warp_detail_range": 1.0,
+    "warp_stage_a_steps": 8000,
+    "warp_complexity_gate": false,
+    "warp_gate_lambda_d": 1.0,
+    "warp_gate_lambda_g": 0.0,
+    "warp_gate_window": 8,
+    "warp_gate_anneal_steps": 0
   },
 
   "training": {

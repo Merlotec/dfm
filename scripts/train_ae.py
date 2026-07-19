@@ -107,6 +107,7 @@ def main():
         gan_start_step=GAN_START_STEP, gan_ramp_steps=GAN_RAMP_STEPS,
         disc_update_threshold=DISC_UPDATE_THRESHOLD, total_steps=total_steps,
         pixel_mask=pixel_mask,
+        norm_stats=(dm.mean, dm.std),   # velocity denorm for the flow aux loss
     ).to(device)
 
     CKPT_DIR.mkdir(exist_ok=True)
@@ -151,11 +152,17 @@ def main():
         rsum, rcnt = 0.0, 0
         for _, pred_b in train_dl:
             prof.data_ready()
-            npred = pred_b.shape[1] - 1                        # frames after X_0
-            t = int(torch.randint(1, npred + 1, (1,)).item()) # Δt ~ Uniform{1..npred}
-            x0 = pred_b[:, 0].to(device, non_blocking=True)
-            xt = pred_b[:, t].to(device, non_blocking=True)
-            recon, disc = trainer.step(x0, xt, pixel_mask=pixel_mask)
+            if cfg.warp_incremental:
+                # incremental composition: consecutive-pair increments composed to
+                # the map from X_0 — uses the WHOLE window, no pair sampling
+                recon, disc = trainer.step_seq(
+                    pred_b.to(device, non_blocking=True), pixel_mask=pixel_mask)
+            else:
+                npred = pred_b.shape[1] - 1                        # frames after X_0
+                t = int(torch.randint(1, npred + 1, (1,)).item()) # Δt ~ Uniform{1..npred}
+                x0 = pred_b[:, 0].to(device, non_blocking=True)
+                xt = pred_b[:, t].to(device, non_blocking=True)
+                recon, disc = trainer.step(x0, xt, pixel_mask=pixel_mask)
             prof.step_done(pred_b.shape[0])
             step = trainer.global_step
             if tprof is not None and step >= args.profile:
@@ -169,7 +176,12 @@ def main():
                       f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}  |  {prof.line()}')
 
         train_recon = rsum / rcnt if rcnt else float('nan')
-        val_recon = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')
+        if val_dl is None:
+            val_recon = float('nan')
+        elif cfg.warp_incremental:
+            val_recon = trainer.validate_seq(val_dl, pixel_mask=val_pm)
+        else:
+            val_recon = trainer.validate(val_dl, pixel_mask=val_pm)
         print(f'  [epoch {epoch:3d}] train_recon={train_recon:.4f}  val_recon={val_recon:.4f}')
         w.writerow([epoch, f'{train_recon:.6f}', f'{val_recon:.6f}']); log.flush()
         if (epoch + 1) % 2 == 0:

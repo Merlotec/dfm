@@ -7,7 +7,7 @@ transformer blocks.
 import torch
 import torch.nn as nn
 from einops import rearrange
-from typing import List
+from typing import Union, List, Optional
 
 from .attention import CrossAttention, LocalSelfAttention2D
 from .config import DFMConfig
@@ -47,20 +47,6 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return rearrange(self.proj(x), 'b c h w -> b h w c')
-
-
-class LearnedPos2D(nn.Module):
-    """Additive learned 2-D positional bias (resolution-specific; kept for reference)."""
-
-    def __init__(self, h: int, w: int, dim: int):
-        super().__init__()
-        self.pos = nn.Parameter(torch.zeros(1, h, w, dim))
-        nn.init.trunc_normal_(self.pos, std=0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pos
-
-
 def sincos_2d(grid_h: int, grid_w: int, dim: int) -> torch.Tensor:
     """
     Deterministic 2-D sinusoidal positional encoding → [grid_h*grid_w, dim].
@@ -80,30 +66,6 @@ def sincos_2d(grid_h: int, grid_w: int, dim: int) -> torch.Tensor:
     rows = torch.arange(grid_h).repeat_interleave(grid_w)        # [grid_h·grid_w]
     cols = torch.arange(grid_w).repeat(grid_h)                    # [grid_h·grid_w]
     return torch.cat([_1d(rows, dim // 2), _1d(cols, dim // 2)], dim=1)  # [grid_h·grid_w, dim]
-
-
-# ---------------------------------------------------------------------------
-# Shallow skip encoder (initial-frame detail anchor for the decoder)
-# ---------------------------------------------------------------------------
-
-class SkipEncoder(nn.Module):
-    """Single-scale, high-resolution features from the raw input frame."""
-
-    def __init__(self, in_channels: int, skip_ch: int):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, skip_ch, 3, padding=1, padding_mode='replicate'),
-            nn.GELU(),
-        )
-
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        return [self.stem(x)]
-
-
-# ---------------------------------------------------------------------------
-# Transformer blocks (pre-norm)
-# ---------------------------------------------------------------------------
-
 class SelfAttnBlock(nn.Module):
     """Pre-norm multi-head self-attention + FFN."""
 
@@ -162,7 +124,7 @@ class CrossAttnBlock(nn.Module):
         self.ffn     = FeedForward(q_dim, mlp_ratio, dropout)
 
     def forward(self, q: torch.Tensor, kv: torch.Tensor,
-                key_bias: torch.Tensor | None = None) -> torch.Tensor:
+                key_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         q = q + self.attn(self.norm_q(q), self.norm_kv(kv), key_bias=key_bias)
         q = q + self.ffn(self.norm2(q))
         return q
@@ -184,48 +146,3 @@ def add_relative_noise(x: torch.Tensor, std: float) -> torch.Tensor:
         return x
     rms = x.detach().float().pow(2).mean(dim=-1, keepdim=True).sqrt()   # [..., 1]
     return x + std * rms.to(x.dtype) * torch.randn_like(x)
-
-
-def slot_log_bias(weights: torch.Tensor) -> torch.Tensor:
-    """Slot weights w_i ∈ [0, 1] → additive cross-attention logit bias log(w_i).
-
-    w=1 → bias 0 (slot fully readable); w=0 → −inf (slot removed from the softmax).
-    """
-    return torch.log(weights.clamp_min(0.0))
-
-
-class SlotHierarchyMask(nn.Module):
-    """
-    Samples per-example monotone slot weights that induce an *ordered* latent.
-
-    For each example we draw a ramp zero-crossing c and set
-
-        w_i = clamp(1 - i/c, 0, 1)        (slot 0 → 1.0, decreasing, 0 for i ≥ c)
-
-    so low-index slots are (almost) always present while high-index slots are
-    randomly attenuated/dropped — the pressure that front-loads information.
-    With probability ``slot_full_prob`` the full, unattenuated ramp (all ones) is
-    used instead, keeping full-width decoding in-distribution.
-    """
-
-    idx: torch.Tensor
-
-    def __init__(self, cfg: DFMConfig):
-        super().__init__()
-        self.n_slots    = cfg.n_slots
-        self.full_prob  = cfg.slot_full_prob
-        self.cutoff_min = cfg.slot_cutoff_min
-        self.register_buffer('idx', torch.arange(cfg.n_slots).float(), persistent=False)
-
-    def sample(self, batch: int, device: torch.device) -> torch.Tensor:
-        """Random training weights [batch, n_slots]."""
-        idx = self.idx.to(device).view(1, -1)                              # [1, K]
-        c   = torch.empty(batch, 1, device=device).uniform_(self.cutoff_min, self.n_slots)
-        w   = (1.0 - idx / c).clamp(0.0, 1.0)                              # [B, K]
-        full = torch.rand(batch, 1, device=device) < self.full_prob
-        return torch.where(full, torch.ones_like(w), w)
-
-    def hard(self, batch: int, n_active: int, device: torch.device) -> torch.Tensor:
-        """Deterministic prefix mask: keep the first `n_active` slots (inference dial)."""
-        keep = (self.idx.to(device) < n_active).float().view(1, -1)
-        return keep.expand(batch, -1)

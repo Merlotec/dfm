@@ -1,141 +1,130 @@
+"""DFM — convection + generative closure, in a latent-rollout model.
+
+The model is a two-part decomposition of fluid evolution:
+
+  * CONVECTION — the latent fully determines a transport map (warp + gain);
+    X_0 is only ever the operand.  Per-step increments are small (inside the
+    warp gradient's basin) and COMPOSED into the map from X_0 (warp.compose):
+    the latent holds bounded-complexity increments (velocity-like), the
+    accumulator holds the unbounded-complexity composite.
+  * CLOSURE — a generative DetailHead paints the sub-resolution residual
+    (the chaos transport cannot carry), conditioned on the convected frame.
+
+The slot set splits into two token streams (transport | detail) that interact
+only through attention: the encoder's shared distillation in phase 1, and the
+evolution transformer in phase 2 — where detail→transport attention is the
+backscatter coupling.  Training is staged, boosting-style, so generation cannot
+replace transport: stage A trains transport alone (the DetailHead is absent);
+stage B freezes transport and fits the residual (GAN lives here — the closure
+is distributional, judged by a discriminator, while transport is pure L2).
+
+Phase 1 (autoencoder.py) trains encoder + heads on ground-truth increment
+sequences; phase 2 (dynamics.py) trains the evolution transformer to roll the
+increment latents forward autonomously.
+"""
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
 class DFMConfig:
-    """
-    Configuration for the latent-rollout fluid model (DFM).
-
-    The model encodes a single frame into a compact set of *slot* tokens, rolls
-    those slots forward through a weight-shared latent evolution operator, and
-    decodes each rolled state back to an image.  Fine spatial detail is supplied
-    to the decoder by a shallow skip encoder anchored on the initial frame — the
-    evolution stream itself is a pure slot bottleneck.
-    """
-
-    # --- image / patch ---
-    img_size: int = 256           # image height (H); also the width when img_w is None (square)
-    img_w: Optional[int] = None   # image width (W); None → square (W = img_size)
-    in_channels: int = 4
+    # --- data / geometry -------------------------------------------------------
+    img_size: int = 256
     patch_px: int = 16
-    # frame_mask: pad non-divisible frames up to a patch multiple and feed the encoders a
-    # 2-channel mask [is_valid, is_inside_frame] so the model tells fluid / collider / pad
-    # apart (a collider is a solid wall; the pad is beyond the simulated frame).
-    frame_mask: bool = False
+    in_channels: int = 4
+    n_mask_ch: int = 1          # mask channels appended to encoder input
 
-    # --- token / slot dimensions ---
-    d_model: int = 256        # patch + slot token dim
-    n_slots: int = 64         # number of evolution (slot) tokens
+    # --- token dims ------------------------------------------------------------
+    d_model: int = 256
+    n_slots: int = 64           # total latent tokens
+    n_detail_slots: int = 16    # last n tokens = detail (closure) stream
     n_heads: int = 8
-
-    # --- encoder (single frame → slots) ---
-    n_enc_layers: int = 4     # self-attention depth over patch tokens
-
-    # --- patch-token self-attention (encoder + decoder) ---
-    local_attn_radius: int = 1  # each patch attends to its (2r+1)² neighbourhood (r=1 → 3×3)
-
-    # --- latent evolution operator ---
-    n_evo_layers: int = 2     # transformer blocks composing one tendency eval
-    integrator: str = 'rk2'   # 'euler' | 'rk2' (midpoint)
-    max_rollout: int = 64     # size of the step-index embedding table
-    reencode_every: int = 0       # nominal re-anchor cadence (eval / validation / inference)
-    reencode_every_min: int = 1   # training: re-anchor cadence ~ Uniform{min .. max} (0 = never)
-    reencode_every_max: int = 4
-
-    # --- decoder (slots → image): full transformer (cross + self-attention) ---
-    n_dec_layers: int = 4     # transformer decoder blocks (cross-attn slots + self-attn patches)
-    skip_ch: int = 32         # shallow skip-encoder channels (initial-frame anchor).  The skip
-                              # is fused via FiLM: latent patch tokens gate/scale it (γ⊙skip+β).
-
-    # --- training rollout ---
-    horizon: int = 4          # nominal horizon (eval / validation / inference default)
-    horizon_min: int = 2      # training: rollout length ~ Uniform{horizon_min .. horizon_max}
-    horizon_max: int = 6
-    horizon_gamma: float = 1.0  # per-step loss discount (1.0 = uniform)
-
-    # --- latent noise (denoising / rollout-stability regularizer, per-slot relative) ---
-    # Phase 2: perturb the *input* latent L_t during teacher forcing (target stays clean),
-    # so the operator learns to pull off-manifold latents back onto the trajectory → less
-    # rollout drift.  Phase 1: perturb L_t before decode, so the (frozen) decoder tolerates
-    # the dynamics' imperfect latents instead of rendering them as artefacts.
-    latent_noise_std: float = 0.0     # phase-2 dynamics input-latent noise
-    ae_decode_noise_std: float = 0.0  # phase-1 AE pre-decode latent noise
-
-    # --- transformer ---
-    mlp_ratio: float = 4.0
-    ae_mlp_ratio: Optional[float] = None   # FFN width for the AE (encoder+decoder); None → mlp_ratio
+    mlp_ratio: float = 4.0      # evolution operator FFN ratio
+    ae_mlp: float = 4.0         # encoder/head FFN ratio
     dropout: float = 0.0
 
-    # --- context encoder (history → conditioning) ---
-    n_context_frames: int = 5
-    ctx_patch_px: int = 16
-    d_ctx: int = 256
-    n_ctx_tokens: int = 64
-    n_ctx_layers: int = 4
-    n_ctx_heads: int = 8
+    # --- encoder (consecutive pair → increment latent) -------------------------
+    n_enc_layers: int = 4
+    n_slot_layers: int = 2
+    local_attn_radius: int = 2
 
-    # --- two-phase latent-AE / dynamics (BPTT-free) ---
-    ae_max_delta: int = 6     # AE pair (X_0, X_t): t sampled Uniform{1 .. ae_max_delta}
-    evolve_state: bool = False    # also evolve the anchor-state embedding s_t in latent
-    state_loss_weight: float = 1.0  # weight of the (teacher-forced) state-prediction loss
-    # Phase 2: decode one predicted latent per step through the *frozen* decoder and add a
-    # pixel-space reconstruction loss, so the dynamics is supervised on what actually shows up
-    # in the image (not just latent MSE).  Gradient flows into the dynamics; the decoder is not
-    # updated.  Still single-step teacher forcing → BPTT-free.  0 = off (pure latent MSE).
-    pixel_loss_weight: float = 0.0
+    # --- transport map (see warp.py) -------------------------------------------
+    warp_map_res: int = 32       # map generated at this res, bilinearly upsampled
+    warp_max_disp: float = 0.06  # per-STEP |disp| bound: a pixel or two — inside
+                                 # every matching basin; composition reaches far
+    warp_gain_range: float = 0.5 # per-step gain range (composite grows by product)
+    warp_divfree: bool = True    # disp = curl(stream fn) + uniform mean flow
+    warp_head_layers: int = 2
 
-    # --- ordered / nested slots (Matryoshka-style; variable token count at inference) ---
-    # When on, the decoder reads the slots through a per-example monotone weight ramp
-    # w_i = clamp(1 - i/c, 0, 1) applied as an additive log-bias on the cross-attention
-    # logits (w=0 → true removal).  The random cutoff c front-loads information into the
-    # low-index slots, so the latent can be truncated to any width at inference.
-    slot_hierarchy: bool = False
-    slot_full_prob: float = 0.25   # fraction of steps trained at full width (all slots, w=1)
-    slot_cutoff_min: float = 1.0   # min ramp zero-crossing c (>=1 → slot 0 always fully active)
-    # Slot self-attention layers in the encoder & decoder (0 = none).  When slot_hierarchy
-    # is on these are *causal* over the priority axis (slot i attends to 0..i), so the
-    # first-N slots stay exactly invariant to the total width.
-    n_slot_layers: int = 0
+    # --- closure (DetailHead) --------------------------------------------------
+    warp_detail_res: int = 64
+    warp_detail_range: float = 1.0
 
-    # Nested dynamics: also train the evolution operator on random slot-prefixes, so the
-    # latent can be *evolved* (not just decoded) at reduced width for real operator compute
-    # savings.  Only meaningful with slot_hierarchy (an ordered latent); needs a phase-2 run.
-    dynamics_hierarchy: bool = False
-    # Hierarchical anchor state: soft-mask the operator's cross-attention over the state
-    # tokens in training so the state encoder front-loads importance, then truncate the
-    # state to the active width at inference — so the anchor conditioning also scales with
-    # the chosen complexity (a simple fluid needs fewer state tokens than a complex one).
-    state_hierarchy: bool = False
+    # --- staged training -------------------------------------------------------
+    # Stage A (step < warp_stage_a_steps): transport only, DetailHead absent.
+    # Stage B: transport frozen (stop-grad through the map), closure fits the
+    # residual; the discriminator activates here (gan_start_step in train_ae.py
+    # should be >= warp_stage_a_steps).
+    warp_stage_a_steps: int = 8000
 
-    # --- GAN discriminator ---
+    # --- flow-over-generation learning aids ------------------------------------
+    # (1) velocity supervision: the data OBSERVES the flow; an annealed aux loss
+    #     ‖d + α·v_phys‖² places each increment inside the right basin.  α is
+    #     FIXED (a learnable α collapses to the degenerate α→0 minimum); set it
+    #     from solver metadata: α_axis ≈ Δt_frame / half-domain-extent.  Signs
+    #     encode render axis orientation.
+    warp_flow_aux_weight: float = 0.1
+    warp_flow_aux_steps: int = 5000
+    warp_vel_channels: tuple = (0, 1)
+    warp_flow_alpha: tuple = (0.01, 0.01)
+    warp_flow_alpha_learnable: bool = False
+    # (2) gain curriculum + conservation prior: gains frozen at 1 early (the only
+    #     way to reduce loss is to WARP), then taxed by λ·|gain−1|₁ forever —
+    #     advection conserves intensity along characteristics.
+    warp_gain_freeze_steps: int = 2000
+    warp_gain_l1: float = 0.01
+    # (3) residual-gated complexity loss (stage A): per-window pixel error
+    #     amplified by local map complexity — complexity must pay for itself in
+    #     proportional local error reduction (automatic, spatially-adaptive
+    #     coarse-to-fine; see warp.gated_recon_loss).  The anneal releases
+    #     chronically-hard regions (turbulent wakes) from the tax.
+    warp_complexity_gate: bool = True
+    warp_gate_lambda_d: float = 1.0
+    warp_gate_lambda_g: float = 0.0
+    warp_gate_window: int = 8
+    warp_gate_anneal_steps: int = 0
+
+    # --- latent noise (denoising / rollout-stability regularizer) --------------
+    ae_decode_noise_std: float = 0.02
+
+    # --- evolution operator (phase 2) ------------------------------------------
+    n_evo_layers: int = 4
+    integrator: str = 'rk2'      # 'euler' | 'rk2'
+    max_rollout: int = 64        # step-embedding table size
+    horizon: int = 4             # eval / inference default rollout length
+    horizon_min: int = 2         # phase-2 training length ~ U{min..max}
+    horizon_max: int = 6
+    latent_loss_weight: float = 1.0   # phase 2: ‖L̂ − L‖ teacher term
+
+    # --- discriminator (stage-B closure GAN) -----------------------------------
     disc_dim: int = 128
-    disc_adv_weight: float = 0.02
-    disc_lr: float = 1e-4
+    disc_adv_weight: float = 0.05
 
-    # --- memory ---
-    gradient_checkpointing: bool = False
+    # --- derived ---------------------------------------------------------------
+    @property
+    def img_hw(self):
+        return (self.img_size, self.img_size)
 
     @property
-    def img_hw(self) -> tuple[int, int]:
-        return (self.img_size, self.img_w or self.img_size)
-
-    @property
-    def n_mask_ch(self) -> int:    # mask channels fed to the encoders (valid [+ inside-frame])
-        return 2 if self.frame_mask else 1
-
-    @property
-    def ae_mlp(self) -> float:     # resolved AE FFN width (falls back to mlp_ratio)
-        return self.ae_mlp_ratio if self.ae_mlp_ratio is not None else self.mlp_ratio
-
-    @property
-    def n_patch_h(self) -> int:
+    def n_patch_h(self):
         return self.img_size // self.patch_px
 
     @property
-    def n_patch_w(self) -> int:
-        return (self.img_w or self.img_size) // self.patch_px
+    def n_patch_w(self):
+        return self.img_size // self.patch_px
 
     @property
-    def n_patch(self) -> int:      # square back-compat; == n_patch_h
-        return self.n_patch_h
+    def n_transport_slots(self):
+        return self.n_slots - self.n_detail_slots
+
+    def __post_init__(self):
+        assert 0 <= self.n_detail_slots < self.n_slots

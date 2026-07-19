@@ -1,3 +1,4 @@
+from typing import Optional, Union
 """
 Attention primitives for DFM.
 
@@ -15,7 +16,7 @@ import torch.nn.functional as F
 
 
 def _scaled_dot(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                bias: torch.Tensor | None = None) -> torch.Tensor:
+                bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     """q/k/v: [..., L, head_dim].  Returns [..., Lq, head_dim].
 
     `bias` (if given) is an additive logit bias broadcastable to [..., Lq, Lk] —
@@ -183,7 +184,7 @@ class CrossAttention(nn.Module):
         self.drop     = nn.Dropout(dropout)
 
     def forward(self, queries: torch.Tensor, context: torch.Tensor,
-                key_bias: torch.Tensor | None = None) -> torch.Tensor:
+                key_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, Lq, _ = queries.shape
         Lk = context.shape[1]
         nh, hd = self.n_heads, self.head_dim
