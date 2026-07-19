@@ -179,14 +179,15 @@ def main():
             if cfg.warp_incremental:
                 # incremental composition: consecutive-pair increments composed to
                 # the map from X_0 — uses the WHOLE window, no pair sampling
-                recon, disc = trainer.step_seq(
+                recon, disc = trainer.step(
                     pred_b.to(device, non_blocking=True), pixel_mask=pixel_mask)
             else:
                 npred = pred_b.shape[1] - 1                        # frames after X_0
                 t = int(torch.randint(1, npred + 1, (1,)).item()) # Δt ~ Uniform{1..npred}
                 x0 = pred_b[:, 0].to(device, non_blocking=True)
                 xt = pred_b[:, t].to(device, non_blocking=True)
-                recon, disc = trainer.step(x0, xt, pixel_mask=pixel_mask)
+                frames = torch.stack([x0, xt], dim=1)
+                recon, disc = trainer.step(frames, pixel_mask=pixel_mask)
             prof.step_done(pred_b.shape[0])
             step = trainer.global_step
             if tprof is not None and step >= args.profile:
