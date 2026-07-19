@@ -77,7 +77,7 @@ class PairEncoder(nn.Module):
             valid = pixel_mask[:, :1].float()
             xa = xa * valid
             xb = xb * valid
-            mask_ch = pixel_mask.float().expand(B, nmc, H, W)
+            mask_ch = pixel_mask[:, :nmc].float().expand(B, nmc, H, W)
         else:
             mask_ch = torch.ones(B, nmc, H, W, device=xa.device, dtype=xa.dtype)
 
