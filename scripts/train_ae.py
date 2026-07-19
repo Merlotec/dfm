@@ -42,7 +42,9 @@ DISC_UPDATE_THRESHOLD = 0.5
 def load_config() -> tuple[DFMConfig, dict]:
     with open(HYPERPARAMS) as f:
         hp = json.load(f)
-    m = {k: v for k, v in hp['model'].items() if not k.startswith('_')}
+    from dataclasses import fields
+    valid_keys = {f.name for f in fields(DFMConfig)}
+    m = {k: v for k, v in hp['model'].items() if k in valid_keys}
     return DFMConfig(**m), hp['training']
 
 

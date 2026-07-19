@@ -104,6 +104,10 @@ class DFMConfig:
     horizon_min: int = 2         # phase-2 training length ~ U{min..max}
     horizon_max: int = 6
     latent_loss_weight: float = 1.0   # phase 2: ‖L̂ − L‖ teacher term
+    ae_max_delta: int = 8
+    n_context_frames: int = 1
+    frame_mask: bool = True
+    warp_incremental: bool = False
 
     # --- discriminator (stage-B closure GAN) -----------------------------------
     disc_dim: int = 128
