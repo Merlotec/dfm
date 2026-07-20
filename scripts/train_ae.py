@@ -176,18 +176,10 @@ def main():
         rsum, rcnt = 0.0, 0
         for _, pred_b in train_dl:
             prof.data_ready()
-            if cfg.warp_incremental:
-                # incremental composition: consecutive-pair increments composed to
-                # the map from X_0 — uses the WHOLE window, no pair sampling
-                recon, disc = trainer.step(
-                    pred_b.to(device, non_blocking=True), pixel_mask=pixel_mask)
-            else:
-                npred = pred_b.shape[1] - 1                        # frames after X_0
-                t = int(torch.randint(1, npred + 1, (1,)).item()) # Δt ~ Uniform{1..npred}
-                x0 = pred_b[:, 0].to(device, non_blocking=True)
-                xt = pred_b[:, t].to(device, non_blocking=True)
-                frames = torch.stack([x0, xt], dim=1)
-                recon, disc = trainer.step(frames, pixel_mask=pixel_mask)
+            # incremental composition: consecutive-pair increments composed to the
+            # map from X_0 over the WHOLE window (the one and only training mode)
+            recon, disc = trainer.step(
+                pred_b.to(device, non_blocking=True), pixel_mask=pixel_mask)
             prof.step_done(pred_b.shape[0])
             step = trainer.global_step
             if tprof is not None and step >= args.profile:
@@ -202,17 +194,16 @@ def main():
                 base = trainer.persistence_baseline(
                     pred_b.to(device, non_blocking=True), pixel_mask=pixel_mask)
                 ratio = recon / base if base > 1e-9 else float('nan')
+                mh = getattr(trainer.ae, '_orig_mod', trainer.ae).decoder.map_head
+                tm = getattr(mh, 'last_trans_mag', 0.0)
+                cm = getattr(mh, 'last_curl_mag', 0.0)
                 print(f'epoch {epoch:3d}  step {step:6d} | recon={recon:.4f} '
-                      f'base={base:.4f} r/b={ratio:.2f}  '
+                      f'base={base:.4f} r/b={ratio:.2f} '
+                      f'|trans|={tm:.4f} |curl|={cm:.4f}  '
                       f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}  |  {prof.line()}')
 
         train_r = rsum / rcnt if rcnt else float('nan')
-        if val_dl is None:
-            val_r = float('nan')
-        elif cfg.warp_incremental:
-            val_r = trainer.validate_seq(val_dl, pixel_mask=val_pm)
-        else:
-            val_r = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')
+        val_r = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')
         train_r, val_r = allreduce_stats(train_r, val_r)
         train_r /= world
         val_r /= world

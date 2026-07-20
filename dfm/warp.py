@@ -214,6 +214,11 @@ class WarpMapHead(nn.Module):
         disp = F.interpolate(disp_lo, size=(H, W), mode='bilinear', align_corners=False)
         if trans is not None:
             disp = disp + trans.view(B, 2, 1, 1)
+        # diagnostics: mean-flow vs local-structure magnitude — makes the
+        # broad-then-specialise progression VISIBLE in the training log
+        # (|trans| should grow first; |curl| should follow as the gate releases)
+        self.last_trans_mag = float(trans.detach().abs().mean()) if trans is not None else 0.0
+        self.last_curl_mag  = float(disp_lo.detach().abs().mean())
         gain = 1.0 + self.gain_range * torch.tanh(
             F.interpolate(gain_raw, size=(H, W), mode='bilinear', align_corners=False))
         return disp, gain
