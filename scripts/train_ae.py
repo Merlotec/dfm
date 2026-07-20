@@ -197,7 +197,13 @@ def main():
             rsum += recon; rcnt += 1
             if step % args.log_every == 0:
                 info = trainer.training_info()
-                print(f'epoch {epoch:3d}  step {step:6d} | recon={recon:.4f}  '
+                # do-nothing baseline for THIS batch: recon/base is the readable
+                # convergence signal (raw recon is dominated by batch difficulty)
+                base = trainer.persistence_baseline(
+                    pred_b.to(device, non_blocking=True), pixel_mask=pixel_mask)
+                ratio = recon / base if base > 1e-9 else float('nan')
+                print(f'epoch {epoch:3d}  step {step:6d} | recon={recon:.4f} '
+                      f'base={base:.4f} r/b={ratio:.2f}  '
                       f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}  |  {prof.line()}')
 
         train_r = rsum / rcnt if rcnt else float('nan')

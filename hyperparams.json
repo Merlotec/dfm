@@ -29,10 +29,10 @@
       0,
       1
     ],
-    "_alpha": "\u03b1_axis \u2248 \u0394t_frame / half-domain-extent; sign encodes render orientation \u2014 set from solver metadata",
+    "_alpha": "MEASURED by scripts/calibrate_alpha.py (48 pairs): true per-step shift -0.0034 coords/frame at v_x~4.3. The old placeholder 0.01 was 11x too large \u2014 the aux loss dragged warps toward ~-0.043 (near the bound) vs true -0.0034, actively fighting recon. Re-run the calibration if solver dt / domain size / render resolution changes. y-axis fit is weakly conditioned (v_y~-0.09, tiny) \u2014 treat alpha_y as approximate.",
     "warp_flow_alpha": [
-      0.01,
-      0.01
+      0.000894,
+      0.002358
     ],
     "warp_flow_alpha_learnable": false,
     "warp_gain_freeze_steps": 2000,

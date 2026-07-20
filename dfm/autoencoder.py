@@ -379,6 +379,23 @@ class AutoencoderTrainer:
         return recon.item(), d_val
 
     @torch.no_grad()
+    def persistence_baseline(self, frames: torch.Tensor,
+                             pixel_mask=None) -> float:
+        """Loss of the DO-NOTHING model (identity map: X̂_s = X_0) on this batch.
+
+        A fresh warp model starts exactly here, and batches differ wildly in how
+        much the field moves (startup window ≈ 0.01, developed flow ≈ 0.3) — so
+        the raw recon number is unreadable without this next to it.  Convergence
+        means recon/base < 1 consistently; recon ≈ base means the warp is doing
+        nothing yet."""
+        x0m = frames[:, 0] * pixel_mask[:, :1] if pixel_mask is not None else frames[:, 0]
+        K1 = frames.shape[1]
+        base = frames.new_zeros(())
+        for s in range(1, K1):
+            base = base + self.criterion(x0m, frames[:, s])
+        return float(base / (K1 - 1))
+
+    @torch.no_grad()
     def validate(self, dataloader, pixel_mask: Optional[torch.Tensor] = None) -> float:
         self.ae.eval()
         device = next(self.ae.parameters()).device
