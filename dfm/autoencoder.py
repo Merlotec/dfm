@@ -32,6 +32,29 @@ from .losses import FluidLoss
 from .warp import WarpDecoder, apply_map, compose, gated_recon_loss, identity_map
 
 
+def remap_ae_pyramid_keys(sd: dict) -> dict:
+    """Back-compat: a pre-pyramid checkpoint stores the single map head at
+    `decoder.map_head.{query,layers.*,head.*}`; the pyramid head keeps those on
+    its BASE level, `decoder.map_head.levels.0.*` (shape-identical).  Rename so the
+    trained coarse flow loads into level 0 instead of being silently dropped by
+    strict=False.  No-op on already-pyramid checkpoints (they have no such keys).
+    rank_embed / slot_layers / flow_alpha stay put — they live on the head itself
+    in both layouts."""
+    if ('decoder.map_head.head.weight' not in sd
+            or 'decoder.map_head.levels.0.head.weight' in sd):
+        return sd                                    # already pyramid, or no map head
+    out = {}
+    for k, v in sd.items():
+        for sub in ('query', 'layers.', 'head.'):
+            pre = f'decoder.map_head.{sub}'
+            if k.startswith(pre):
+                k = f'decoder.map_head.levels.0.{sub}{k[len(pre):]}'
+                break
+        out[k] = v
+    print('  [load] remapped pre-pyramid map head -> levels.0 (coarse flow preserved)')
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Pair encoder: (X_{s-1}, X_s) → increment latent L_s
 # ---------------------------------------------------------------------------
@@ -451,7 +474,7 @@ class AutoencoderTrainer:
     def load(self, path: str):
         def _u(m): return getattr(m, '_orig_mod', m)
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        _u(self.ae).load_state_dict(ckpt['ae'], strict=False)
+        _u(self.ae).load_state_dict(remap_ae_pyramid_keys(ckpt['ae']), strict=False)
         if 'discriminator' in ckpt:
             _u(self.discriminator).load_state_dict(ckpt['discriminator'], strict=False)
         for name, opt in [('gen_optimizer', self.gen_optimizer),

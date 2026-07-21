@@ -22,7 +22,7 @@
     "warp_head_layers": 2,
     "warp_detail_res": 64,
     "warp_detail_range": 1.0,
-    "warp_stage_a_steps": 8000,
+    "warp_stage_a_steps": 20000,
     "warp_flow_aux_weight": 0.1,
     "warp_flow_aux_steps": 5000,
     "warp_vel_channels": [
