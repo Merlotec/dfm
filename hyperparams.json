@@ -73,6 +73,7 @@
     "num_workers": 10,
     "cache_frames": false,
     "compile": true,
-    "disable_gan": true
+    "disable_gan": true,
+    "checkpoint_after": 1000
   }
 }

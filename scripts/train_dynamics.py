@@ -174,6 +174,13 @@ def main():
             if step % args.log_every == 0:
                 print(f'epoch {epoch:3d}  step {step:6d} | field={field:.5f} latent={latent:.5f}  |  {prof.line()}')
 
+            ckpt_after = train_hp.get('checkpoint_after', 0)
+            if ckpt_after > 0 and step > 0 and step % ckpt_after == 0:
+                if is_main():
+                    path = CKPT_DIR / f'dyn_step{step:06d}.pt'
+                    trainer.save(str(path))
+                    print(f'  [ckpt] {path.name}')
+
         train_f = fsum / count if count else float('nan')
         train_l = lsum / count if count else float('nan')
         val_f = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')

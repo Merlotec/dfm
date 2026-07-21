@@ -209,6 +209,13 @@ def main():
                       f'|trans|={tm:.4f} |curl|={cm:.4f}  '
                       f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}  |  {prof.line()}')
 
+            ckpt_after = train_hp.get('checkpoint_after', 0)
+            if ckpt_after > 0 and step > 0 and step % ckpt_after == 0:
+                if is_main():
+                    path = CKPT_DIR / f'ae_step{step:06d}.pt'
+                    trainer.save(str(path))
+                    print(f'  [ckpt] {path.name}')
+
         train_r = rsum / rcnt if rcnt else float('nan')
         val_r = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')
         train_r, val_r = allreduce_stats(train_r, val_r)
