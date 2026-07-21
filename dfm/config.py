@@ -57,6 +57,8 @@ class DFMConfig:
 
     # --- closure (DetailHead) --------------------------------------------------
     warp_detail_res: int = 64
+    grad_checkpoint: bool = True   # recompute the per-step DetailHead in
+                                   # backward (stage-B memory; see _seq_pass)
     warp_detail_range: float = 1.0
 
     # --- staged training -------------------------------------------------------

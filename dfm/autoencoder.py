@@ -274,7 +274,18 @@ class AutoencoderTrainer:
             D, G = compose(D, G, d, g)
             xhat = apply_map(x0m, D, G)
             if stage_b:
-                xhat = xhat + detail_head(latent[:, nt:], xhat, out_hw=(H, W)).float()
+                # gradient-checkpoint the DetailHead: it adds a 64x64 transformer
+                # forward on EVERY one of the ~K rollout steps, all retained for
+                # BPTT — the memory spike that OOMs the instant stage B turns on.
+                # Recompute in backward instead (transport froze here, so the only
+                # live graph is the detail path — cheap to redo).
+                if training and cfg.grad_checkpoint:
+                    from torch.utils.checkpoint import checkpoint
+                    res = checkpoint(lambda ds, c: detail_head(ds, c, out_hw=(H, W)),
+                                     latent[:, nt:], xhat, use_reentrant=False)
+                else:
+                    res = detail_head(latent[:, nt:], xhat, out_hw=(H, W))
+                xhat = xhat + res.float()
             step_report = self.criterion(xhat, frames[:, s])
             report_sum = report_sum + step_report
             if gate:
