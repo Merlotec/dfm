@@ -66,6 +66,8 @@ def main():
     p.add_argument('--log-every',  type=int, default=50)
     p.add_argument('--no-compile', action='store_true',
                    help='Disable torch.compile even if enabled in hyperparams.json')
+    p.add_argument('--no-gan', action='store_true',
+                   help='Disable the GAN completely')
     p.add_argument('--profile', type=int, default=0, metavar='N',
                    help='Profile the first N steps with torch.profiler, print a kernel breakdown, then exit')
     args = p.parse_args()
@@ -121,10 +123,12 @@ def main():
         val_pm = load_pixel_mask(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, vr, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
         val_dl = vdm.val_dataloader()
 
+    disable_gan = args.no_gan or train_hp.get('disable_gan', False)
+    actual_gan_start = 10**9 if disable_gan else GAN_START_STEP
     trainer = AutoencoderTrainer(
         cfg, lr=train_hp['lr'], weight_decay=train_hp['weight_decay'],
         l1_weight=train_hp['l1_weight'], clip_grad=train_hp['clip_grad'],
-        gan_start_step=GAN_START_STEP, gan_ramp_steps=GAN_RAMP_STEPS,
+        gan_start_step=actual_gan_start, gan_ramp_steps=GAN_RAMP_STEPS,
         disc_update_threshold=DISC_UPDATE_THRESHOLD, total_steps=total_steps,
         pixel_mask=pixel_mask,
         norm_stats=(dm.mean, dm.std),   # velocity denorm for the flow aux loss
@@ -157,7 +161,10 @@ def main():
     print(f'Discriminator: {n(trainer.discriminator):.1f}M params')
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:       {len(dm._dataset)} sequences  (ae_max_delta={cfg.ae_max_delta})')
-    print(f'Curriculum:    GAN activates at step {GAN_START_STEP}\n')
+    if disable_gan:
+        print('Curriculum:    GAN is DISABLED\n')
+    else:
+        print(f'Curriculum:    GAN activates at step {GAN_START_STEP}\n')
 
     log = None
     if is_main():

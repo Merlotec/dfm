@@ -57,10 +57,10 @@
     "disc_dim": 128,
     "disc_adv_weight": 0.05,
     "_pyramid": "flow pyramid: warp_pyramid_levels>1 sums div-free displacement at doubling res (base=warp_map_res). Base carries mean-flow+gain; finer levels are pure flow detail, |disp| decayed, penalised more, unlocked on a curriculum.",
-    "warp_pyramid_levels": 1,
+    "warp_pyramid_levels": 2,
     "warp_level_disp_decay": 0.5,
-    "warp_pyramid_unlock_steps": 0,
-    "warp_level_l2": 0.0
+    "warp_pyramid_unlock_steps": 6000,
+    "warp_level_l2": 0.01
   },
   "training": {
     "batch_size": 64,
@@ -72,6 +72,7 @@
     "latent_loss_weight": 0.1,
     "num_workers": 10,
     "cache_frames": false,
-    "compile": true
+    "compile": true,
+    "disable_gan": true
   }
 }
