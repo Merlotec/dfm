@@ -55,6 +55,25 @@ class DFMConfig:
     warp_divfree: bool = True    # disp = curl(stream fn) + uniform mean flow
     warp_head_layers: int = 2
 
+    # --- flow pyramid (coarse->fine displacement) ------------------------------
+    # The displacement is a sum of div-free levels at doubling resolution
+    #   res_i = warp_map_res * 2^i ,   i = 0..warp_pyramid_levels-1
+    # coarse level carries mean flow + bulk; each finer level ADDS a smaller
+    # residual (SpyNet/optical-flow pyramid; sum works because per-step maps are
+    # small and curl is linear, so the sum stays div-free).  Mean-flow and GAIN
+    # live ONLY on the base level — finer levels are pure flow detail, never
+    # generation, keeping the transport/closure split intact at fine scale.
+    #   1 = single level (identical to the pre-pyramid model).
+    warp_pyramid_levels: int = 1
+    warp_level_disp_decay: float = 0.5   # level-i |disp| bound = warp_max_disp * decay^i
+    # curriculum: unlock one finer level every N steps (0 = all active at once).
+    # Finer heads are zero-init, so an unlock is a smooth no-op that then learns.
+    warp_pyramid_unlock_steps: int = 0
+    # regularization: L2 on each finer level's displacement, scaled by level index
+    # (finer penalized MORE — smooth flow is the default, fine structure earns its
+    # place).  0 disables.  Applied in the trainer via map_head.last_level_mags.
+    warp_level_l2: float = 0.0
+
     # --- closure (DetailHead) --------------------------------------------------
     warp_detail_res: int = 64
     grad_checkpoint: bool = True   # recompute the per-step DetailHead in

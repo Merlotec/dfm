@@ -117,10 +117,10 @@ class LatentAutoencoder(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        # heads must start as exact no-ops: map head → identity map (a fresh model
-        # decodes X_0 exactly); detail head → zero residual (stage B starts from
-        # stage A's optimum).  The trunc_normal sweep above re-randomised them.
-        heads = [self.decoder.map_head.head]
+        # heads must start as exact no-ops: every pyramid level → zero displacement
+        # (identity map, fresh model decodes X_0 exactly), detail head → zero
+        # residual.  The trunc_normal sweep above re-randomised them.
+        heads = [lvl.head for lvl in self.decoder.map_head.levels]
         if self.decoder.detail_head is not None:
             heads.append(self.decoder.detail_head.head)
         for head in heads:
@@ -221,9 +221,7 @@ class AutoencoderTrainer:
         """Returns (recon_report, recon_grad, reg, aux, xhat_last, x_last).
 
         recon_report = plain criterion (comparable across configs); recon_grad =
-        what the optimiser sees (== report unless the complexity gate is active).
-        Map math runs in fp32: composite displacement accumulates over steps and
-        bf16 position error is visible after warping."""
+        what the optimiser sees. Map math runs in bf16-mixed: composite displacement accumulates over steps."""
         cfg = self.cfg
         ae = getattr(self.ae, '_orig_mod', self.ae)
         map_head, detail_head = ae.decoder.map_head, ae.decoder.detail_head
@@ -246,18 +244,31 @@ class AutoencoderTrainer:
             lam_scale = max(0.0, 1.0 - self.global_step / cfg.warp_gate_anneal_steps)
             gate = lam_scale > 0.0
 
-        D, G = identity_map(B, C, H, W, frames.device, torch.float32)
+        # flow-pyramid curriculum: unlock one finer level every unlock_steps, so
+        # the coarse bulk flow settles before finer residuals are introduced.
+        # (stage B keeps all levels — transport is frozen, so no more unlocking.)
+        if cfg.warp_pyramid_levels > 1 and cfg.warp_pyramid_unlock_steps > 0 and not stage_b:
+            map_head.n_active_levels = 1 + self.global_step // cfg.warp_pyramid_unlock_steps
+        else:
+            map_head.n_active_levels = None       # all levels active
+
+        amp = frames.device.type in ('cuda', 'xpu')
+        D, G = identity_map(B, C, H, W, frames.device, torch.bfloat16 if amp else torch.float32)
         report_sum = frames.new_zeros(())
         grad_sum   = frames.new_zeros(())
         reg_sum    = frames.new_zeros(())
         aux_sum    = frames.new_zeros(())
         xhat = None
+        # bf16 autocast on CUDA *and* XPU — the attention/head matmuls are the bulk
+        # of the cost. The warp math now stays in bf16-mixed on PVC.
+        _ac = torch.autocast(device_type=frames.device.type, dtype=torch.bfloat16,
+                             enabled=amp)
         for s in range(1, K1):
+          with _ac:
             latent = ae.encode(frames[:, s - 1], frames[:, s], pixel_mask)
             if training:
                 latent = add_relative_noise(latent, cfg.ae_decode_noise_std)
             d, g = map_head(latent[:, :nt], out_hw=(H, W))
-            d, g = d.float(), g.float()
             if stage_b:
                 # transport frozen: stage-B loss must not reshape the map — the
                 # "cannot replace" guarantee is this detach plus stage A itself
@@ -266,6 +277,12 @@ class AutoencoderTrainer:
                 g = torch.ones_like(g)
             elif not stage_b:
                 reg_sum = reg_sum + (g - 1.0).abs().mean()
+                # flow-pyramid: penalise finer levels more (smooth flow is default).
+                # Into grad_sum (the objective) at its OWN weight — not reg_sum,
+                # which the loss re-scales by warp_gain_l1.  Stage-A only: in stage
+                # B the map is frozen, so this must not train it.
+                if cfg.warp_level_l2 > 0:
+                    grad_sum = grad_sum + cfg.warp_level_l2 * map_head.last_level_penalty
             if aux_w > 0:
                 # backward fetch ≈ upstream: d(p) ≈ −α ⊙ v_phys(p) — physics as
                 # scaffolding, annealed away by _flow_aux_weight

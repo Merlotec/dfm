@@ -123,105 +123,139 @@ def _curl(psi: torch.Tensor, h: float) -> torch.Tensor:
 # MapHead: slots → (disp, gain)
 # ---------------------------------------------------------------------------
 
-class WarpMapHead(nn.Module):
-    """Reads the slot latent through cross-attention at a low-resolution query
-    grid and emits the map fields.  Structurally cannot see X_0."""
+class _MapLevel(nn.Module):
+    """One pyramid level: slots -> a div-free displacement at resolution m.
+
+    The base level (is_base) additionally emits the uniform mean-flow term and
+    the gain field.  Finer levels emit ONLY a curl residual — no mean flow, no
+    gain — so fine scales are pure flow detail and can never generate.
+    Zero-init head => a fresh (or freshly-unlocked) level is an exact no-op.
+    """
 
     pos: torch.Tensor
+
+    def __init__(self, cfg: DFMConfig, m: int, max_disp: float, is_base: bool):
+        super().__init__()
+        self.cfg, self.m, self.max_disp, self.is_base = cfg, m, max_disp, is_base
+        C = cfg.in_channels
+        self.query = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
+        self.register_buffer('pos', sincos_2d(m, m, cfg.d_model).unsqueeze(0),
+                             persistent=False)
+        self.layers = nn.ModuleList([
+            CrossAttnBlock(cfg.d_model, cfg.d_model, cfg.n_heads, cfg.ae_mlp, cfg.dropout)
+            for _ in range(cfg.warp_head_layers)
+        ])
+        # channels: divfree base = psi(1)+trans(2)+gain(C); divfree fine = psi(1);
+        # raw base = disp(2)+gain(C); raw fine = disp(2)
+        if cfg.warp_divfree:
+            n_ch = (3 + C) if is_base else 1
+        else:
+            n_ch = (2 + C) if is_base else 2
+        self.head = nn.Linear(cfg.d_model, n_ch)
+        nn.init.trunc_normal_(self.query, std=0.02)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, slots, out_hw):
+        cfg = self.cfg
+        B = slots.shape[0]
+        m = self.m
+        H, W = out_hw
+        q = self.query.expand(B, m * m, -1) + self.pos
+        for layer in self.layers:
+            q = layer(q, slots)
+        raw = self.head(q).permute(0, 2, 1).reshape(B, -1, m, m)
+
+        trans = None
+        gain = None
+        if cfg.warp_divfree:
+            h = 2.0 / m
+            A = self.max_disp * h / 2.0
+            disp_lo = _curl(A * torch.tanh(raw[:, :1]), h)
+            if self.is_base:
+                trans = self.max_disp * torch.tanh(raw[:, 1:3].mean(dim=(2, 3)))
+                gain_raw = raw[:, 3:]
+        else:
+            disp_lo = self.max_disp * torch.tanh(raw[:, :2])
+            gain_raw = raw[:, 2:] if self.is_base else None
+        disp = F.interpolate(disp_lo, size=(H, W), mode='bilinear', align_corners=False)
+        if trans is not None:
+            disp = disp + trans.view(B, 2, 1, 1)
+        if self.is_base:
+            gain = 1.0 + cfg.warp_gain_range * torch.tanh(
+                F.interpolate(gain_raw, size=(H, W), mode='bilinear', align_corners=False))
+        return disp, gain, trans
+
+
+class WarpMapHead(nn.Module):
+    """Coarse->fine flow PYRAMID.  Total displacement is the sum of per-level
+    div-free fields at doubling resolution; the base level also carries mean flow
+    and gain.  Structurally cannot see X_0.  A single level (warp_pyramid_levels
+    == 1) is identical to the pre-pyramid head."""
 
     def __init__(self, cfg: DFMConfig):
         super().__init__()
         self.cfg = cfg
-        m = cfg.warp_map_res
-        C = cfg.in_channels
+        self.max_disp   = cfg.warp_max_disp          # base level (for gate/aux norm)
+        self.gain_range = cfg.warp_gain_range
 
-        self.query = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
-        self.register_buffer('pos', sincos_2d(m, m, cfg.d_model).unsqueeze(0),
-                             persistent=False)            # [1, m·m, d]
-        # slot identity + self-mixing before the map readout
+        # slot identity + self-mixing, shared across levels
         self.rank_embed = nn.Parameter(torch.zeros(1, cfg.n_slots, cfg.d_model))
         self.slot_layers = nn.ModuleList([
             SelfAttnBlock(cfg.d_model, cfg.n_heads, cfg.ae_mlp, cfg.dropout)
             for _ in range(cfg.n_slot_layers)
         ])
-        self.layers = nn.ModuleList([
-            CrossAttnBlock(cfg.d_model, cfg.d_model, cfg.n_heads, cfg.ae_mlp, cfg.dropout)
-            for _ in range(cfg.warp_head_layers)
-        ])
-        # per-STEP maps are deliberately SMALL (the true per-step displacement is
-        # a pixel or two — inside the warp gradient's basin); the composite
-        # reaches large displacements by composition, never by search.
-        self.max_disp   = cfg.warp_max_disp
-        self.gain_range = cfg.warp_gain_range
+        nn.init.trunc_normal_(self.rank_embed, std=0.02)
 
-        # flow scale for the velocity-supervised aux loss (trainer-side):
-        # d ≈ −α ⊙ v_phys per axis.  FIXED from config by default — a learnable α
-        # collapses to the degenerate aux minimum (α→0 makes the target vanish and
-        # d→0 satisfies it; observed).  Signs encode render axis orientation.
-        # Lives here so it rides state_dict / device moves for free.
+        # pyramid levels: res doubles, |disp| bound decays (finer = smaller residual)
+        self.levels = nn.ModuleList([
+            _MapLevel(cfg, m=cfg.warp_map_res * (2 ** i),
+                      max_disp=cfg.warp_max_disp * (cfg.warp_level_disp_decay ** i),
+                      is_base=(i == 0))
+            for i in range(cfg.warp_pyramid_levels)
+        ])
+        # curriculum: trainer sets this; None => all levels active
+        self.n_active_levels: Optional[int] = None
+
+        # flow-aux scale (see trainer); fixed by default.  Lives here for state_dict.
         self.flow_alpha = nn.Parameter(torch.tensor(cfg.warp_flow_alpha, dtype=torch.float32),
                                        requires_grad=cfg.warp_flow_alpha_learnable)
-
-        # divfree: 1 stream-fn channel + 2 UNIFORM-TRANSLATION channels + C gains.
-        # The translation term exists because a tanh-bounded ψ cannot hold the
-        # linear ramp a constant displacement requires — without it the divfree
-        # mode cannot represent net translation (freestream advection!) at all;
-        # a constant field is itself divergence-free, so exactness is preserved.
-        # Mean flow + fluctuation: the classical decomposition, by construction.
-        n_map_ch = (3 if cfg.warp_divfree else 2) + C
-        self.head = nn.Linear(cfg.d_model, n_map_ch)
-        nn.init.trunc_normal_(self.query, std=0.02)
-        nn.init.trunc_normal_(self.rank_embed, std=0.02)
-        # zero-init the head → disp = 0, gain = 1: a fresh model decodes X_0 exactly
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
+        # diagnostics
+        self.last_trans_mag = 0.0
+        self.last_curl_mag  = 0.0
+        self.last_level_mags: list = []
 
     def forward(self, slots: torch.Tensor,
                 out_hw: Optional[Tuple[int, int]] = None
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """slots [B,S,d] → (disp [B,2,H,W], gain [B,C,H,W]) at out_hw (default cfg.img_hw)."""
         cfg = self.cfg
-        B = slots.shape[0]
-        m = cfg.warp_map_res
         H, W = out_hw if out_hw is not None else cfg.img_hw
 
         slots = slots + self.rank_embed[:, :slots.shape[1]]
         for blk in self.slot_layers:
             slots = blk(slots)
-        q = self.query.expand(B, m * m, -1) + self.pos
-        for layer in self.layers:
-            q = layer(q, slots)
-        raw = self.head(q).permute(0, 2, 1).reshape(B, -1, m, m)   # [B, n_map_ch, m, m]
 
-        trans = None
-        if cfg.warp_divfree:
-            # ψ amplitude chosen so the finite-difference curl obeys the soft bound:
-            # |Δψ| ≤ 2A over spacing h=2/m  →  |curl| ≤ 2A/h = max_disp for A below.
-            h = 2.0 / m
-            A = self.max_disp * h / 2.0
-            psi = A * torch.tanh(raw[:, :1])
-            disp_lo = _curl(psi, h)
-            # uniform translation (grid-pooled, per sample): the mean-flow mode the
-            # bounded ψ cannot express.  Total |d| soft-bounded by 2·max_disp.
-            trans = self.max_disp * torch.tanh(raw[:, 1:3].mean(dim=(2, 3)))  # [B,2]
-            gain_raw = raw[:, 3:]
-        else:
-            disp_lo = self.max_disp * torch.tanh(raw[:, :2])
-            gain_raw = raw[:, 2:]
+        n_act = self.n_active_levels if self.n_active_levels is not None else len(self.levels)
+        n_act = max(1, min(n_act, len(self.levels)))
 
-        # low-res → full res: bilinear upsampling is the "priced novelty" bottleneck —
-        # the gain can only paint content at warp_map_res smoothness.
-        disp = F.interpolate(disp_lo, size=(H, W), mode='bilinear', align_corners=False)
-        if trans is not None:
-            disp = disp + trans.view(B, 2, 1, 1)
-        # diagnostics: mean-flow vs local-structure magnitude — makes the
-        # broad-then-specialise progression VISIBLE in the training log
-        # (|trans| should grow first; |curl| should follow as the gate releases)
-        self.last_trans_mag = float(trans.detach().abs().mean()) if trans is not None else 0.0
-        self.last_curl_mag  = float(disp_lo.detach().abs().mean())
-        gain = 1.0 + self.gain_range * torch.tanh(
-            F.interpolate(gain_raw, size=(H, W), mode='bilinear', align_corners=False))
-        return disp, gain
+        disp_total = None
+        gain = None
+        self.last_level_mags = []
+        # differentiable per-level penalty, finer weighted more (i+1), fine levels
+        # only — cached for the trainer to add as cfg.warp_level_l2 * this
+        self.last_level_penalty = slots.new_zeros(())
+        for i, lvl in enumerate(self.levels[:n_act]):
+            d, g, trans = lvl(slots, (H, W))
+            disp_total = d if disp_total is None else disp_total + d
+            if i == 0:
+                gain = g
+                self.last_trans_mag = float(trans.detach().abs().mean()) if trans is not None else 0.0
+                self.last_curl_mag = float((d - (trans.view(-1, 2, 1, 1) if trans is not None else 0.0)
+                                            ).detach().abs().mean())
+            else:
+                self.last_level_penalty = self.last_level_penalty + (i + 1) * (d ** 2).mean()
+            self.last_level_mags.append(float(d.detach().abs().mean()))
+        return disp_total, gain
 
 
 class WarpDecoder(nn.Module):

@@ -84,7 +84,8 @@ class RolloutTrainer:
             teachers = [self.ae.encode(frames[:, s - 1], frames[:, s], pixel_mask)
                         for s in range(1, K + 1)]
 
-        D, G = identity_map(B, C, H, W, frames.device, torch.float32)
+        amp = frames.device.type in ('cuda', 'xpu')
+        D, G = identity_map(B, C, H, W, frames.device, torch.bfloat16 if amp else torch.float32)
         field_sum  = frames.new_zeros(())
         latent_sum = frames.new_zeros(())
         xhat = None
@@ -146,7 +147,8 @@ class RolloutTrainer:
         B, C, H, W = x0.shape
         x0m = x0 * pixel_mask[:, :1] if pixel_mask is not None else x0
         L = self.ae.encode(x0, x0, pixel_mask)
-        D, G = identity_map(B, C, H, W, x0.device, torch.float32)
+        amp = x0.device.type in ('cuda', 'xpu')
+        D, G = identity_map(B, C, H, W, x0.device, torch.bfloat16 if amp else torch.float32)
         frames = []
         for s in range(n_steps):
             L = self.evo(L, step_idx=s)
