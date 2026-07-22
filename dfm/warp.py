@@ -60,11 +60,29 @@ def base_grid(B: int, H: int, W: int, device, dtype) -> torch.Tensor:
 def _sample(field: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     """grid_sample with the conventions used throughout this module.
 
-    padding: 'border' (replicate — the right physics at domain edges, e.g. the
-    inflow boundary), except on MPS which doesn't implement it; local dev on Mac
-    falls back to 'zeros' (matches the hole/pad value of masked data)."""
-    pad = 'zeros' if field.device.type == 'mps' else 'border'
-    return F.grid_sample(field, grid, mode='bilinear', padding_mode=pad,
+    padding: 'border' (replicate -- the right physics at domain edges, e.g. the
+    inflow boundary).  MPS still raises "Unsupported Border padding mode" (checked
+    on torch 2.7.1), so there we clamp the grid into the field's interior and
+    sample with 'zeros' instead.  That reproduces border EXACTLY for bilinear:
+    border clips the sampling index to [0, N-1], and a coordinate sitting on the
+    edge pixel centre interpolates to precisely that pixel's value.  With
+    align_corners=False the pixel centre x=0 is at normalised 1/W - 1 and
+    x=W-1 at 1 - 1/W, which is the clamp below (verified bit-exact against native
+    border on CPU).
+
+    The previous MPS fallback was padding_mode='zeros', which is wrong twice over:
+    normalised 0 is the dataset MEAN (~free-stream velocity), and compose()
+    resamples the GAIN field -- whose identity is 1, not 0 -- so gain decayed
+    toward 0 and progressively darkened the boundary across a rollout.  Mac
+    inference therefore disagreed with the cluster; it now matches.
+    """
+    if field.device.type == 'mps':
+        H, W = field.shape[-2], field.shape[-1]
+        gx = grid[..., 0].clamp(1.0 / W - 1.0, 1.0 - 1.0 / W)
+        gy = grid[..., 1].clamp(1.0 / H - 1.0, 1.0 - 1.0 / H)
+        return F.grid_sample(field, torch.stack((gx, gy), dim=-1), mode='bilinear',
+                             padding_mode='zeros', align_corners=False)
+    return F.grid_sample(field, grid, mode='bilinear', padding_mode='border',
                          align_corners=False)
 
 
@@ -127,16 +145,31 @@ _FILL_CACHE: dict = {}
 _FILL_CACHE_MAX = 8          # bounded: a caller passing fresh tensors can't grow it forever
 
 
-def fill_index_for(pixel_mask: torch.Tensor) -> torch.Tensor:
-    """build_fill_index() memoised per mask tensor (train / val / per-mesh masks)."""
+def _hole_bbox(valid: torch.Tensor) -> Optional[Tuple[int, int, int, int]]:
+    """(y0, y1, x0, x1) bounding box of the non-fluid pixels, or None if all fluid.
+
+    Cached with the fill index: computing it per call would need .item() syncs in
+    the training loop, which is exactly what you do not want on an accelerator.
+    """
+    hole = ~valid.reshape(*valid.shape[-2:]).bool()
+    if not bool(hole.any()):
+        return None
+    rows = torch.nonzero(hole.any(dim=1)).flatten()
+    cols = torch.nonzero(hole.any(dim=0)).flatten()
+    return (int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1)
+
+
+def fill_index_for(pixel_mask: torch.Tensor):
+    """build_fill_index() + hole bbox, memoised per mask tensor.  Returns (index, bbox)."""
     key = (id(pixel_mask), tuple(pixel_mask.shape), str(pixel_mask.device))
     hit = _FILL_CACHE.get(key)
     if hit is None:
-        hit = (pixel_mask, build_fill_index(pixel_mask[:, :1]))
+        v = pixel_mask[:, :1]
+        hit = (pixel_mask, build_fill_index(v), _hole_bbox(v))
         if len(_FILL_CACHE) >= _FILL_CACHE_MAX:
             _FILL_CACHE.pop(next(iter(_FILL_CACHE)))     # evict oldest (insertion order)
         _FILL_CACHE[key] = hit
-    return hit[1]
+    return hit[1], hit[2]
 
 
 def apply_fill(x: torch.Tensor, fill_index: torch.Tensor) -> torch.Tensor:
@@ -146,20 +179,88 @@ def apply_fill(x: torch.Tensor, fill_index: torch.Tensor) -> torch.Tensor:
     return x.reshape(B, C, -1).gather(2, idx).reshape(x.shape)
 
 
+def smooth_fill(x: torch.Tensor, hole: torch.Tensor, iters: int,
+                bbox: Optional[Tuple[int, int, int, int]] = None) -> torch.Tensor:
+    """Relax filled hole values toward the harmonic (Laplace) interpolant.
+
+    The nearest-fluid gather is piecewise CONSTANT: every hole pixel copies exactly
+    one donor, so the filled region is a Voronoi patchwork with visible facets, and
+    a displacement sweeping across it sees discontinuous jumps.  Averaging each hole
+    pixel with its neighbours while pinning the real fluid values is Jacobi iteration
+    on Laplace's equation -- its solution is the smoothest field agreeing with the
+    surrounding fluid, i.e. a gradient blend of whatever is nearby.
+
+    Seeded from the NN fill it converges in a handful of passes (a cold start from
+    zeros would need O(hole_width^2)).  Fluid pixels are re-pinned every iteration,
+    so real data is never modified and the blend can only ever affect masked pixels.
+    """
+    if iters <= 0:
+        return x
+    # Only the hole NEIGHBOURHOOD can change: Jacobi propagates one pixel per pass,
+    # so relaxing the hole bbox grown by `iters` is identical to relaxing the whole
+    # frame -- and with holes at a few percent of the image it is ~10x cheaper.
+    H, W = x.shape[-2], x.shape[-1]
+    if bbox is None:
+        y0, y1, x0, x1 = 0, H, 0, W
+    else:
+        y0, y1, x0, x1 = bbox
+        y0, x0 = max(0, y0 - iters), max(0, x0 - iters)
+        y1, x1 = min(H, y1 + iters), min(W, x1 + iters)
+    sub, sub_hole = x[..., y0:y1, x0:x1], hole[..., y0:y1, x0:x1]
+    for _ in range(iters):
+        avg = F.avg_pool2d(F.pad(sub, (1, 1, 1, 1), mode='replicate'), 3, stride=1)
+        sub = torch.where(sub_hole, avg, sub)   # fluid pixels stay EXACT
+    if bbox is None:
+        return sub
+    out = x.clone()
+    out[..., y0:y1, x0:x1] = sub
+    return out
+
+
 def masked_source(x0: torch.Tensor, pixel_mask: Optional[torch.Tensor],
-                  fill_holes: bool = False) -> torch.Tensor:
+                  fill_holes: bool = False, smooth_iters: int = 0) -> torch.Tensor:
     """The X_0 that apply_map fetches from.
 
     fill_holes=False reproduces the original behaviour exactly (zero out non-fluid);
-    True substitutes nearest-fluid ghost values instead.  Fluid pixels are untouched
-    either way, and the loss stays masked to fluid, so filled values are never
-    supervised -- they only stop the sampler returning a wrong number.
+    True substitutes ghost values instead -- nearest-fluid, then optionally smoothed
+    into a harmonic blend by smooth_iters passes.  Fluid pixels are untouched either
+    way, and the loss stays masked to fluid, so filled values are never supervised --
+    they only stop the sampler returning a wrong number.
     """
     if pixel_mask is None:
         return x0
     if not fill_holes:
         return x0 * pixel_mask[:, :1]
-    return apply_fill(x0, fill_index_for(pixel_mask))
+    idx, bbox = fill_index_for(pixel_mask)
+    out = apply_fill(x0, idx)
+    if smooth_iters > 0 and bbox is not None:
+        out = smooth_fill(out, ~pixel_mask[:, :1].bool(), smooth_iters, bbox)
+    return out
+
+
+def hole_fetch_penalty(disp: torch.Tensor, pixel_mask: torch.Tensor) -> torch.Tensor:
+    """Penalise transport that fetches from INSIDE the geometry.
+
+    X̂(p) = G(p)·X_0(p + D(p)) is a BACKWARD map, so a fluid pixel whose displacement
+    lands in a collider is asserting that fluid was advected out of solid material --
+    physically impossible.  Sampling the fluid mask through the same grid gives each
+    fetch's occupancy (1 = landed in fluid, 0 = landed in a hole); the penalty is the
+    squared shortfall averaged over FLUID pixels only, since what a hole pixel
+    fetches is never used.  Differentiable in `disp` via grid_sample's grid argument.
+
+    Complementary to the ghost-cell fill: the fill makes an illegal fetch return a
+    plausible value instead of the dataset mean, this makes the model prefer not to
+    make one.  Note fetches outside the image RECTANGLE are not penalised -- border
+    padding replicates the edge, and advecting in from an inflow boundary is legal.
+    """
+    B, _, H, W = disp.shape
+    valid = pixel_mask[:, :1].to(disp.dtype)
+    if valid.shape[0] != B:
+        valid = valid.expand(B, -1, -1, -1)
+    grid = base_grid(B, H, W, disp.device, disp.dtype) + disp.permute(0, 2, 3, 1)
+    occ  = _sample(valid, grid)
+    short = (1.0 - occ).clamp(min=0.0) ** 2
+    return (short * valid).sum() / valid.sum().clamp_min(1.0)
 
 
 def compose(disp_prev: torch.Tensor, gain_prev: torch.Tensor,

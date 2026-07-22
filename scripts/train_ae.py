@@ -161,6 +161,13 @@ def main():
     print(f'Discriminator: {n(trainer.discriminator):.1f}M params')
     start_epoch     = trainer.global_step // steps_per_epoch
     print(f'Dataset:       {len(dm._dataset)} sequences  (ae_max_delta={cfg.ae_max_delta})')
+    # printed AFTER resume so global_step (and therefore the unlocked level count)
+    # reflects the checkpoint, not step 0
+    print(trainer.pyramid_report())
+    print(f'Delta curric.: d_max={trainer._delta_max()} of {cfg.ae_max_delta} '
+          f'(warp_delta_ramp_steps={cfg.warp_delta_ramp_steps}'
+          f'{", DISABLED -> d=1" if cfg.warp_delta_ramp_steps <= 0 else ""})')
+    print(f'Ghost cells:   warp_fill_holes={cfg.warp_fill_holes}')
     if disable_gan:
         print('Curriculum:    GAN is DISABLED\n')
     else:
@@ -211,7 +218,7 @@ def main():
                 cm = getattr(mh, 'last_curl_mag', 0.0)
                 print(f'epoch {epoch:3d}  step {step:6d} | recon={recon:.4f} '
                       f'base={base:.4f} r/b={ratio:.2f} '
-                      f'|trans|={tm:.4f} |curl|={cm:.4f}  '
+                      f'|trans|={tm:.4f} |curl|={cm:.4f} hole={trainer.last_hole_pen:.5f}  '
                       f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}  |  {prof.line()}')
 
             ckpt_after = train_hp.get('checkpoint_after', 0)

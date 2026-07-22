@@ -150,7 +150,13 @@ def main():
     print(f'EvolutionOperator: {n(trainer.evo):.1f}M params')
     print(f'AE (frozen):       {n(trainer.ae):.1f}M params')
     start_epoch     = trainer.global_step // steps_per_epoch
-    print(f'Dataset:        {len(dm._dataset)} sequences\n')
+    print(f'Dataset:        {len(dm._dataset)} sequences')
+    # phase 2 freezes the AE, so every level it was built with is active
+    _mh = getattr(trainer.ae, '_orig_mod', trainer.ae).decoder.map_head
+    print(f'Pyramid (frozen AE): {len(_mh.levels)} level(s) '
+          f'(warp_pyramid_levels={cfg.warp_pyramid_levels}), all active — '
+          + ', '.join(f'L{i}:{l.m}x{l.m}' for i, l in enumerate(_mh.levels)))
+    print(f'Ghost cells:    warp_fill_holes={cfg.warp_fill_holes}\n')
 
     log = None
     if is_main():

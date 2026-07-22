@@ -31,7 +31,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dfm import DFMConfig, LatentAutoencoder, EvolutionOperator
-from dfm.autoencoder import remap_ae_pyramid_keys
+from dfm.autoencoder import remap_ae_pyramid_keys, strip_compile_prefix
 from dfm.warp import masked_source
 from dfm.data import build_renderer, load_pixel_mask, FVMSequenceDataset
 from dfm.warp import identity_map
@@ -154,12 +154,20 @@ def main():
         if args.ae is None:
             raise SystemExit('phase-2 checkpoint needs --ae <AE checkpoint>')
         ae_ckpt = torch.load(args.ae, map_location='cpu', weights_only=False)
-        ae.load_state_dict(remap_ae_pyramid_keys(ae_ckpt['ae']), strict=False)
+        _sd = remap_ae_pyramid_keys(strip_compile_prefix(ae_ckpt['ae']))
+        _miss, _unexp = ae.load_state_dict(_sd, strict=False)
+        if _miss or _unexp:
+            print(f'  [warn] AE only partially loaded: {len(_miss)} missing, '
+                  f'{len(_unexp)} unexpected keys')
         evo = EvolutionOperator(cfg).to(device).eval()
-        evo.load_state_dict(ckpt['evo'])
+        evo.load_state_dict(strip_compile_prefix(ckpt['evo']))
         mode = 'phase-2 autonomous rollout'
     else:                                                # phase-1 AE checkpoint
-        ae.load_state_dict(remap_ae_pyramid_keys(ckpt['ae']), strict=False)
+        _sd = remap_ae_pyramid_keys(strip_compile_prefix(ckpt['ae']))
+        _miss, _unexp = ae.load_state_dict(_sd, strict=False)
+        if _miss or _unexp:
+            print(f'  [warn] AE only partially loaded: {len(_miss)} missing, '
+                  f'{len(_unexp)} unexpected keys')
         mode = 'phase-1 teacher-forced reconstruction'
     print(f'device={device}  mode={mode}  detail={use_detail}  '
           f'pyramid_levels={cfg.warp_pyramid_levels}')

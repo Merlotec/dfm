@@ -71,9 +71,20 @@ class RolloutTrainer:
         self.evo = wrap_ddp(self.evo, device, find_unused_parameters=True)
 
     def load_ae(self, path: str):
-        from .autoencoder import remap_ae_pyramid_keys
+        from .autoencoder import remap_ae_pyramid_keys, strip_compile_prefix
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        self.ae.load_state_dict(remap_ae_pyramid_keys(ckpt['ae']), strict=False)
+        sd = remap_ae_pyramid_keys(strip_compile_prefix(ckpt['ae']))
+        missing, unexpected = self.ae.load_state_dict(sd, strict=False)
+        # strict=False is needed for the pyramid remap, but it also means a genuine
+        # architecture mismatch loads NOTHING and trains the dynamics against a
+        # randomly-initialised decoder, silently.  Say so instead.
+        if missing or unexpected:
+            print(f'  [load_ae] WARNING: {len(missing)} missing, {len(unexpected)} '
+                  f'unexpected keys -- the frozen AE is only PARTIALLY loaded.')
+            for k in list(missing)[:5]:    print(f'    missing:    {k}')
+            for k in list(unexpected)[:5]: print(f'    unexpected: {k}')
+        else:
+            print(f'  [load_ae] all {len(sd)} tensors loaded cleanly')
         for p in self.ae.parameters():
             p.requires_grad_(False)
         self.ae.eval()
@@ -211,13 +222,19 @@ class RolloutTrainer:
     # ---- checkpointing --------------------------------------------------------
 
     def save(self, path: str):
-        torch.save({'evo': self.evo.state_dict(), 'opt': self.opt.state_dict(),
+        # Unwrap torch.compile before serialising, exactly as AutoencoderTrainer.save
+        # does -- saving from the compiled handle writes `_orig_mod.`-prefixed keys
+        # that will not load into a bare EvolutionOperator (infer.py, or --resume,
+        # which restores BEFORE compile is applied).
+        def _u(m): return getattr(m, '_orig_mod', m)
+        torch.save({'evo': _u(self.evo).state_dict(), 'opt': self.opt.state_dict(),
                     'scheduler': self.scheduler.state_dict(), 'cfg': self.cfg,
                     'global_step': self.global_step}, path)
 
     def load(self, path: str):
+        from .autoencoder import strip_compile_prefix
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        self.evo.load_state_dict(ckpt['evo'])
+        self.evo.load_state_dict(strip_compile_prefix(ckpt['evo']))
         for name, obj in [('opt', self.opt), ('scheduler', self.scheduler)]:
             if name in ckpt:
                 try:

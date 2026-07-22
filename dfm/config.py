@@ -60,6 +60,16 @@ class DFMConfig:
     # so it costs one cached gather per window.  See warp.build_fill_index.
     # NOTE: changes the transport solution -- stage A must be retrained, not resumed.
     warp_fill_holes: bool = True
+    # Jacobi passes that relax the nearest-fluid gather into a harmonic (Laplace)
+    # blend, so the ghost region is a smooth gradient of nearby fluid rather than a
+    # piecewise-constant Voronoi patchwork.  0 = plain nearest-neighbour.  Costs one
+    # 3x3 average per pass over X_0, once per window.  See warp.smooth_fill.
+    warp_fill_smooth_iters: int = 0
+    # Weight on the illegal-fetch penalty: the backward map should never source a
+    # fluid pixel from inside a collider.  0 disables.  The raw penalty is a
+    # fraction in [0,1] (mean squared mask shortfall over fluid pixels), so tune it
+    # against the `hole=` value now logged each step.  See warp.hole_fetch_penalty.
+    warp_hole_penalty: float = 0.0
     warp_head_layers: int = 2
 
     # --- flow pyramid (coarse->fine displacement) ------------------------------

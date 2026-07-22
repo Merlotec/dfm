@@ -29,8 +29,25 @@ from .modules import (PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SelfAttnBl
                       sincos_2d, add_relative_noise)
 from .discriminator import DFMDiscriminator
 from .losses import FluidLoss
-from .warp import (WarpDecoder, apply_map, compose, gated_recon_loss, identity_map,
-                   masked_source)
+from .warp import (WarpDecoder, apply_map, compose, gated_recon_loss, hole_fetch_penalty,
+                   identity_map, masked_source)
+
+
+def strip_compile_prefix(sd: dict) -> dict:
+    """Drop torch.compile's `_orig_mod.` prefix from state_dict keys.
+
+    torch.compile(m) returns an OptimizedModule whose state_dict is prefixed, so a
+    checkpoint written from the compiled handle will not load into the bare module.
+    Savers now unwrap first (see AutoencoderTrainer.save / RolloutTrainer.save);
+    this keeps checkpoints ALREADY written with the prefix loadable.
+
+    Doubly important on the strict=False paths (load_ae, infer): there a prefix
+    mismatch does not raise, it silently loads NOTHING and leaves random weights.
+    """
+    if not any(k.startswith('_orig_mod.') for k in sd):
+        return sd
+    return {k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k: v
+            for k, v in sd.items()}
 
 
 def remap_ae_pyramid_keys(sd: dict) -> dict:
@@ -194,6 +211,7 @@ class AutoencoderTrainer:
         self.gan_ramp_steps        = gan_ramp_steps
         self.disc_update_threshold = disc_update_threshold
         self.global_step           = 0
+        self.last_hole_pen         = 0.0
 
     # ---- plumbing -------------------------------------------------------------
 
@@ -222,6 +240,56 @@ class AutoencoderTrainer:
         ramp = min(1.0, (self.global_step - self.gan_start_step)
                    / max(1, self.gan_ramp_steps))
         return self.cfg.disc_adv_weight * ramp
+
+    def _active_levels(self, stage_b: bool) -> Optional[int]:
+        """What map_head.n_active_levels should be now (None => every level active).
+
+        Single source of truth for the pyramid curriculum: _seq_pass assigns it and
+        pyramid_report() prints it, so the log can never disagree with training.
+        """
+        cfg = self.cfg
+        if cfg.warp_pyramid_levels > 1 and cfg.warp_pyramid_unlock_steps > 0 and not stage_b:
+            return 1 + self.global_step // cfg.warp_pyramid_unlock_steps
+        return None
+
+    def pyramid_report(self) -> str:
+        """Human-readable pyramid state — how many levels exist, which are UNLOCKED
+        right now, and when the next one arrives.  `warp_pyramid_levels` only says
+        how many were BUILT; the curriculum decides how many actually contribute,
+        so a run can be configured for 3 levels while using 1."""
+        cfg = self.cfg
+        ae  = getattr(self.ae, '_orig_mod', self.ae)
+        mh  = ae.decoder.map_head
+        n_built = len(mh.levels)
+        stage_b = (ae.decoder.detail_head is not None
+                   and self.global_step >= cfg.warp_stage_a_steps)
+        n_act = self._active_levels(stage_b)
+        n_act = n_built if n_act is None else max(1, min(n_act, n_built))
+
+        lines = [f'Pyramid:       {n_built} level(s) built '
+                 f'(warp_pyramid_levels={cfg.warp_pyramid_levels}), '
+                 f'{n_act} ACTIVE at step {self.global_step}']
+        if n_built != cfg.warp_pyramid_levels:                    # shouldn't happen
+            lines.append(f'               [WARN] built count != config!')
+        for i, lvl in enumerate(mh.levels):
+            if i < n_act:
+                state = 'active'
+            elif cfg.warp_pyramid_unlock_steps > 0:
+                state = f'locked until step {i * cfg.warp_pyramid_unlock_steps}'
+            else:
+                state = 'locked'
+            lines.append(f'                 L{i}  res {lvl.m:>3d}x{lvl.m:<3d} '
+                         f'max|disp|={lvl.max_disp:.4f}  [{state}]')
+        if cfg.warp_pyramid_unlock_steps > 0 and n_act < n_built:
+            lines.append(f'               next unlock at step '
+                         f'{n_act * cfg.warp_pyramid_unlock_steps} '
+                         f'(every {cfg.warp_pyramid_unlock_steps})')
+        elif cfg.warp_pyramid_unlock_steps <= 0:
+            lines.append('               unlock curriculum DISABLED '
+                         '(warp_pyramid_unlock_steps=0) -> all levels active')
+        if stage_b:
+            lines.append('               stage B: transport frozen, all levels active')
+        return '\n'.join(lines)
 
     def _delta_max(self) -> int:
         """Curriculum cap on the per-segment jump size d (1 => the original model).
@@ -280,7 +348,8 @@ class AutoencoderTrainer:
         stage_b = detail_head is not None and self.global_step >= cfg.warp_stage_a_steps
         B, K1, C, H, W = frames.shape
         K = K1 - 1
-        x0m = masked_source(frames[:, 0], pixel_mask, cfg.warp_fill_holes)
+        x0m = masked_source(frames[:, 0], pixel_mask, cfg.warp_fill_holes,
+                            cfg.warp_fill_smooth_iters)
 
         freeze = training and not stage_b and self.global_step < cfg.warp_gain_freeze_steps
         aux_w = self._flow_aux_weight() if (training and not stage_b) else 0.0
@@ -298,10 +367,7 @@ class AutoencoderTrainer:
         # flow-pyramid curriculum: unlock one finer level every unlock_steps, so
         # the coarse bulk flow settles before finer residuals are introduced.
         # (stage B keeps all levels — transport is frozen, so no more unlocking.)
-        if cfg.warp_pyramid_levels > 1 and cfg.warp_pyramid_unlock_steps > 0 and not stage_b:
-            map_head.n_active_levels = 1 + self.global_step // cfg.warp_pyramid_unlock_steps
-        else:
-            map_head.n_active_levels = None       # all levels active
+        map_head.n_active_levels = self._active_levels(stage_b)   # None => all active
 
         amp = frames.device.type in ('cuda', 'xpu')
         D, G = identity_map(B, C, H, W, frames.device, torch.bfloat16 if amp else torch.float32)
@@ -310,6 +376,7 @@ class AutoencoderTrainer:
         reg_sum    = frames.new_zeros(())
         aux_sum    = frames.new_zeros(())
         xhat = None
+        hole_acc = 0.0            # diagnostic: mean illegal-fetch penalty this window
         # bf16 autocast on CUDA *and* XPU — the attention/head matmuls are the bulk
         # of the cost. The warp math now stays in bf16-mixed on PVC.
         _ac = torch.autocast(device_type=frames.device.type, dtype=torch.bfloat16,
@@ -348,6 +415,13 @@ class AutoencoderTrainer:
                 v_phys = frames[:, s, vc] * v_std + v_mean
                 aux_sum = aux_sum + ((d + dl * alpha * v_phys) ** 2).mean()
             D, G = compose(D, G, d, g)
+            # penalise on the COMPOSITE map: D is what apply_map actually fetches
+            # through.  Stage-A only -- in stage B the map is detached, so this
+            # would have no gradient path to train anything.
+            if cfg.warp_hole_penalty > 0 and not stage_b and pixel_mask is not None:
+                hp = hole_fetch_penalty(D, pixel_mask)
+                grad_sum = grad_sum + cfg.warp_hole_penalty * hp
+                hole_acc = hole_acc + float(hp.detach())
             xhat = apply_map(x0m, D, G)
             if stage_b:
                 # gradient-checkpoint the DetailHead: it adds a 64x64 transformer
@@ -378,6 +452,7 @@ class AutoencoderTrainer:
         # supervised endpoints, and dividing by K would silently shrink the loss
         # (and the gradient) as the delta curriculum ramps up.
         n_seg = len(segments)
+        self.last_hole_pen = hole_acc / max(1, n_seg)
         return (report_sum / n_seg, grad_sum / n_seg, reg_sum / n_seg, aux_sum / n_seg,
                 xhat, frames[:, K])
 
