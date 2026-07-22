@@ -212,6 +212,7 @@ class AutoencoderTrainer:
         self.disc_update_threshold = disc_update_threshold
         self.global_step           = 0
         self.last_hole_pen         = 0.0
+        self.last_segments         = None
 
     # ---- plumbing -------------------------------------------------------------
 
@@ -385,6 +386,7 @@ class AutoencoderTrainer:
         # always stepping s-1 -> s, so ONE latent can mean "advance d frames".
         # Validation stays at d == 1 so val_recon is comparable across the ramp.
         segments = self._partition(K, self._delta_max() if training else 1)
+        self.last_segments = segments      # persistence_baseline scores the SAME frames
         for (t0, dl) in segments:
           s = t0 + dl                                   # target frame for this segment
           with _ac:
@@ -553,13 +555,26 @@ class AutoencoderTrainer:
         much the field moves (startup window ≈ 0.01, developed flow ≈ 0.3) — so
         the raw recon number is unreadable without this next to it.  Convergence
         means recon/base < 1 consistently; recon ≈ base means the warp is doing
-        nothing yet."""
-        x0m = frames[:, 0] * pixel_mask[:, :1] if pixel_mask is not None else frames[:, 0]
-        K1 = frames.shape[1]
+        nothing yet.
+
+        MUST average the SAME frames recon did.  With the delta curriculum a window
+        is partitioned into random jumps and recon is scored only at the segment
+        ENDPOINTS -- a single d=8 segment scores at s=8 alone, the farthest and
+        hardest frame.  Averaging the baseline over all of s=1..8 (including the
+        easy near frames) would then inflate r/b purely as an artefact and make it
+        incomparable with pre-curriculum runs.  self.last_segments is set by the
+        _seq_pass that just ran, so the two line up step for step.
+        """
+        cfg = self.cfg
+        x0m = masked_source(frames[:, 0], pixel_mask, cfg.warp_fill_holes,
+                            cfg.warp_fill_smooth_iters)
+        segs = getattr(self, 'last_segments', None)
+        targets = ([t0 + dl for t0, dl in segs] if segs
+                   else list(range(1, frames.shape[1])))
         base = frames.new_zeros(())
-        for s in range(1, K1):
+        for s in targets:
             base = base + self.criterion(x0m, frames[:, s])
-        return float(base / (K1 - 1))
+        return float(base / max(1, len(targets)))
 
     @torch.no_grad()
     def validate(self, dataloader, pixel_mask: Optional[torch.Tensor] = None) -> float:
