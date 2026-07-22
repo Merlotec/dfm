@@ -38,8 +38,16 @@ class RolloutTrainer:
     def __init__(self, cfg: DFMConfig, lr: float = 3e-4, weight_decay: float = 1e-5,
                  clip_grad: float = 1.0, l1_weight: float = 0.1,
                  total_steps: Optional[int] = None,
-                 pixel_mask: Optional[torch.Tensor] = None):
+                 pixel_mask: Optional[torch.Tensor] = None,
+                 latent_loss_weight: Optional[float] = None):
         self.cfg = cfg
+        # hyperparams.json carries latent_loss_weight in BOTH the model and the
+        # training section.  This used to read only cfg (the model value), so the
+        # training-section value was dead config -- with 1.0 vs 0.1 that made the
+        # latent term ~20x the field term, i.e. a near-pure latent regressor.
+        # Explicit argument wins; None falls back to the model-config default.
+        self.latent_loss_weight = (cfg.latent_loss_weight if latent_loss_weight is None
+                                   else float(latent_loss_weight))
         self.ae = LatentAutoencoder(cfg)
         for p in self.ae.parameters():
             p.requires_grad_(False)
@@ -107,9 +115,10 @@ class RolloutTrainer:
         self.evo.train()
         K = min(frames.shape[1] - 1,
                 random.randint(cfg.horizon_min, cfg.horizon_max))
+        self.last_K = K            # so reference_losses() can match this step's horizon
         self.opt.zero_grad()
         field, latent, _ = self._rollout(frames, pixel_mask, K, training=True)
-        loss = field + cfg.latent_loss_weight * latent
+        loss = field + self.latent_loss_weight * latent
         (bad,) = allreduce_stats(0.0 if torch.isfinite(loss) else 1.0)
         if bad > 0.0:
             self.opt.zero_grad()
@@ -129,16 +138,58 @@ class RolloutTrainer:
         self.global_step += 1
 
     @torch.no_grad()
-    def validate(self, dataloader, pixel_mask: Optional[torch.Tensor] = None) -> float:
+    def reference_losses(self, frames: torch.Tensor,
+                         pixel_mask: Optional[torch.Tensor] = None,
+                         K: Optional[int] = None) -> Tuple[float, float]:
+        """The two reference points that make `field` readable — (teacher_forced, persistence).
+
+        `field` alone is uninterpretable: it is bounded below by the FROZEN AE's own
+        reconstruction error, so a flat field loss can mean either "the dynamics
+        operator has stopped improving" or "it is already at the decoder's floor".
+
+        teacher_forced — the identical rollout, but decoding the TRUE latents instead
+          of evo's predictions.  This IS that floor: the best field loss reachable
+          with this AE.  field/teacher_forced ~ 1 means the operator is done and the
+          remaining error is the autoencoder's, not the dynamics'.
+        persistence   — the do-nothing model (X̂_s = X_0), the phase-2 twin of
+          AutoencoderTrainer.persistence_baseline, giving the same readable r/b.
+
+        Costs an extra decode rollout, so call it at logging cadence, not every step.
+        """
+        cfg = self.cfg
+        B, K1, C, H, W = frames.shape
+        K = min(K1 - 1, cfg.horizon if K is None else K)
+        x0 = frames[:, 0]
+        x0m = masked_source(x0, pixel_mask, cfg.warp_fill_holes)
+        teachers = [self.ae.encode(frames[:, s - 1], frames[:, s], pixel_mask)
+                    for s in range(1, K + 1)]
+        amp = frames.device.type in ('cuda', 'xpu')
+        D, G = identity_map(B, C, H, W, frames.device,
+                            torch.bfloat16 if amp else torch.float32)
+        tf_sum   = frames.new_zeros(())
+        pers_sum = frames.new_zeros(())
+        for s in range(1, K + 1):
+            xhat, D, G = self.ae.decoder.step(teachers[s - 1], D, G, x0m, use_detail=True)
+            tf_sum   = tf_sum + self.criterion(xhat, frames[:, s])
+            pers_sum = pers_sum + self.criterion(x0m, frames[:, s])
+        return float(tf_sum / K), float(pers_sum / K)
+
+    @torch.no_grad()
+    def validate(self, dataloader, pixel_mask: Optional[torch.Tensor] = None
+                 ) -> Tuple[float, float, float]:
+        """(field, teacher_forced, persistence) averaged over the loader."""
         self.evo.eval()
         device = next(self.evo.parameters()).device
-        total, count = 0.0, 0
+        total, tf_total, pers_total, count = 0.0, 0.0, 0.0, 0
         for _, pred_b in dataloader:
             frames = pred_b.to(device)
             K = min(frames.shape[1] - 1, self.cfg.horizon)
             field, _, _ = self._rollout(frames, pixel_mask, K, training=False)
-            total += float(field); count += 1
-        return total / count if count else float('nan')
+            tf, pers = self.reference_losses(frames, pixel_mask, K=K)
+            total += float(field); tf_total += tf; pers_total += pers; count += 1
+        if not count:
+            return float('nan'), float('nan'), float('nan')
+        return total / count, tf_total / count, pers_total / count
 
     @torch.no_grad()
     def rollout(self, x0: torch.Tensor, n_steps: int,

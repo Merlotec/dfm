@@ -119,8 +119,12 @@ def main():
         cfg, lr=train_hp['lr'], weight_decay=train_hp['weight_decay'],
         clip_grad=train_hp['clip_grad'], total_steps=total_steps,
         pixel_mask=pixel_mask,
+        latent_loss_weight=train_hp.get('latent_loss_weight'),
     ).to(device)
 
+    print(f'latent_loss_weight: {trainer.latent_loss_weight}  '
+          f'(model cfg {cfg.latent_loss_weight}, training section '
+          f'{train_hp.get("latent_loss_weight")})')
     print(f'Loading frozen AE: {args.ae}')
     trainer.load_ae(args.ae)
 
@@ -153,7 +157,8 @@ def main():
         log = open(CKPT_DIR / 'dyn_loss_log.csv', 'a', newline='')
         w = csv.writer(log)
         if (CKPT_DIR / 'dyn_loss_log.csv').stat().st_size == 0:
-            w.writerow(['epoch', 'train_field_loss', 'train_latent_loss', 'val_field_loss']); log.flush()
+            w.writerow(['epoch', 'train_field_loss', 'train_latent_loss', 'val_field_loss',
+                        'val_teacher_forced', 'val_persistence']); log.flush()
 
     prof  = LoopProfiler(device)
     tprof = make_profiler(args.profile > 0, device)
@@ -177,7 +182,15 @@ def main():
                 print(f'  [WARN] step {step}: NaN field loss'); continue
             fsum += field; lsum += latent; count += 1
             if step % args.log_every == 0:
-                print(f'epoch {epoch:3d}  step {step:6d} | field={field:.5f} latent={latent:.5f}  |  {prof.line()}')
+                # f/tf ~ 1 => at the frozen AE's floor (dynamics done);
+                # f/b  is the phase-1-style persistence ratio.
+                tf, base = trainer.reference_losses(pred_b, pixel_mask=pixel_mask,
+                                                    K=trainer.last_K)
+                f_tf = field / tf   if tf   > 1e-9 else float('nan')
+                f_b  = field / base if base > 1e-9 else float('nan')
+                print(f'epoch {epoch:3d}  step {step:6d} | field={field:.5f} '
+                      f'tf={tf:.5f} base={base:.5f} f/tf={f_tf:.2f} f/b={f_b:.2f} '
+                      f'latent={latent:.5f}  |  {prof.line()}')
 
             ckpt_after = train_hp.get('checkpoint_after', 0)
             if ckpt_after > 0 and step > 0 and step % ckpt_after == 0:
@@ -188,16 +201,26 @@ def main():
 
         train_f = fsum / count if count else float('nan')
         train_l = lsum / count if count else float('nan')
-        val_f = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')
+        val_f, val_tf, val_base = (trainer.validate(val_dl, pixel_mask=val_pm)
+                                   if val_dl else (float('nan'),) * 3)
 
-        train_f, train_l, val_f = allreduce_stats(train_f, train_l, val_f)
+        train_f, train_l, val_f, val_tf, val_base = allreduce_stats(
+            train_f, train_l, val_f, val_tf, val_base)
         train_f /= world
         train_l /= world
         val_f /= world
+        val_tf /= world
+        val_base /= world
 
         if is_main():
-            print(f'  [epoch {epoch:3d}] train_field={train_f:.5f} train_latent={train_l:.5f}  val_field={val_f:.5f}')
-            w.writerow([epoch, f'{train_f:.6f}', f'{train_l:.6f}', f'{val_f:.6f}']); log.flush()
+            vf_tf = val_f / val_tf   if val_tf   > 1e-9 else float('nan')
+            vf_b  = val_f / val_base if val_base > 1e-9 else float('nan')
+            print(f'  [epoch {epoch:3d}] train_field={train_f:.5f} '
+                  f'train_latent={train_l:.5f}  val_field={val_f:.5f} '
+                  f'val_tf={val_tf:.5f} val_base={val_base:.5f} '
+                  f'val_f/tf={vf_tf:.2f} val_f/b={vf_b:.2f}')
+            w.writerow([epoch, f'{train_f:.6f}', f'{train_l:.6f}', f'{val_f:.6f}',
+                        f'{val_tf:.6f}', f'{val_base:.6f}']); log.flush()
             if (epoch + 1) % 2 == 0:
                 path = CKPT_DIR / f'dyn_epoch{epoch:03d}.pt'
                 trainer.save(str(path)); print(f'  [ckpt] {path.name}')
