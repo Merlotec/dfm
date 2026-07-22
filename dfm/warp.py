@@ -175,8 +175,19 @@ def compose(disp_prev: torch.Tensor, gain_prev: torch.Tensor,
     Only smooth map fields are resampled here; the image is resampled once, at
     apply_map time.
     """
+    # The composite and the increment do NOT always share a dtype: _seq_pass keeps
+    # both in bf16 under autocast, but WarpDecoder.step upcasts the increment with
+    # .float() while the composite starts as bf16 (identity_map under amp).  Adding
+    # a fp32 increment to a bf16 base_grid promotes grid_inc to fp32, and
+    # grid_sample then rejects the bf16 field ("expected BFloat16 but found Float").
+    # Promote everything to the wider dtype: same-dtype callers are unaffected,
+    # mixed callers keep the higher precision instead of crashing.  Only reachable
+    # on cuda/xpu, where amp is on -- which is why CPU/MPS never hit it.
+    dt = torch.promote_types(disp_prev.dtype, disp_inc.dtype)
+    disp_prev, gain_prev = disp_prev.to(dt), gain_prev.to(dt)
+    disp_inc,  gain_inc  = disp_inc.to(dt),  gain_inc.to(dt)
     B, _, H, W = disp_prev.shape
-    grid_inc = base_grid(B, H, W, disp_prev.device, disp_prev.dtype) \
+    grid_inc = base_grid(B, H, W, disp_prev.device, dt) \
         + disp_inc.permute(0, 2, 3, 1)
     disp_new = disp_inc + _sample(disp_prev, grid_inc)
     gain_new = gain_inc * _sample(gain_prev, grid_inc)
