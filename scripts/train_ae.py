@@ -180,6 +180,11 @@ def main():
     # re-forking against an ever-larger parent each epoch (fork ENOMEM).
     train_dl = dm.train_dataloader()
     for epoch in range(start_epoch, n_epochs):
+        # Reshuffle the DistributedSampler each epoch — without this every rank
+        # replays the SAME shard order every epoch (no-op for the plain
+        # RandomSampler of a single-process run, which has no set_epoch).
+        if hasattr(train_dl.sampler, 'set_epoch'):
+            train_dl.sampler.set_epoch(epoch)
         rsum, rcnt = 0.0, 0
         for _, pred_b in train_dl:
             prof.data_ready()

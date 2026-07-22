@@ -79,6 +79,89 @@ def apply_map(x0: torch.Tensor, disp: torch.Tensor, gain: torch.Tensor) -> torch
     return gain * _sample(x0, grid)
 
 
+def build_fill_index(valid: torch.Tensor) -> torch.Tensor:
+    """Flat gather index [H*W]: fluid pixels map to themselves, non-fluid pixels to
+    their nearest fluid pixel (Chebyshev-nearest; ties -> largest linear index).
+
+    Ghost cells for the BACKWARD map.  `padding_mode='border'` in _sample only
+    extrapolates outside the image RECTANGLE; it cannot help a displacement that
+    lands in a collider *inside* the frame, because the source image is hard-zeroed
+    there (x0 * pixel_mask).  And 0 is not a neutral "no data" value: frames are
+    normalised (raw - mean)/std, so 0 IS the dataset mean -- roughly free-stream
+    velocity, injected straight into a boundary layer.  Filling with the nearest
+    real fluid value is the zero-gradient (Neumann) condition instead.
+
+    The mask is static per geometry, so this is built once and reused for every
+    frame; see fill_index_for().
+    """
+    v = valid.reshape(*valid.shape[-2:]).bool()
+    H, W = v.shape
+    assert H * W < 2 ** 24, 'linear indices must stay exactly representable in fp32'
+    lin   = torch.arange(H * W, device=valid.device, dtype=torch.float32).view(1, 1, H, W)
+    known = v.view(1, 1, H, W)
+    if not bool(known.any()):
+        return lin.reshape(-1).long()          # degenerate: no fluid at all
+    out = torch.where(known, lin, torch.full_like(lin, -1.0))
+    # Dilate the known region one ring at a time.  Accepting only pixels that
+    # become reachable on THIS ring makes the donor Chebyshev-nearest; max_pool
+    # pads with -inf, and a pixel's own 3x3 window contains itself, so an
+    # all-unknown neighbourhood stays negative and is simply not accepted yet.
+    while not bool(known.all()):
+        cand  = F.max_pool2d(out, kernel_size=3, stride=1, padding=1)
+        newly = (~known) & (cand >= 0)
+        if not bool(newly.any()):
+            break                              # region unreachable from any fluid
+        out   = torch.where(newly, cand, out)
+        known = known | newly
+    return out.reshape(-1).clamp_min(0).long()
+
+
+# id() is only sound as a cache key while the object is alive, so each entry keeps a
+# strong reference to the mask -- that pins it and makes id() reuse impossible.
+# Key on the CALLER's mask object, never on a slice of it: `pixel_mask[:, :1]` builds
+# a fresh tensor on every call, so keying on the slice missed every time (rebuilding
+# the index per window and pinning a new slice each time -- a leak *and* a slowdown).
+# Callers therefore have to hand in the same long-lived mask object each call, which
+# is how pixel_mask / val_pm / pmask are already set up once and threaded down.
+_FILL_CACHE: dict = {}
+_FILL_CACHE_MAX = 8          # bounded: a caller passing fresh tensors can't grow it forever
+
+
+def fill_index_for(pixel_mask: torch.Tensor) -> torch.Tensor:
+    """build_fill_index() memoised per mask tensor (train / val / per-mesh masks)."""
+    key = (id(pixel_mask), tuple(pixel_mask.shape), str(pixel_mask.device))
+    hit = _FILL_CACHE.get(key)
+    if hit is None:
+        hit = (pixel_mask, build_fill_index(pixel_mask[:, :1]))
+        if len(_FILL_CACHE) >= _FILL_CACHE_MAX:
+            _FILL_CACHE.pop(next(iter(_FILL_CACHE)))     # evict oldest (insertion order)
+        _FILL_CACHE[key] = hit
+    return hit[1]
+
+
+def apply_fill(x: torch.Tensor, fill_index: torch.Tensor) -> torch.Tensor:
+    """Gather x through a fill index -> non-fluid pixels take their nearest fluid value."""
+    B, C = x.shape[:2]
+    idx = fill_index.view(1, 1, -1).expand(B, C, -1)
+    return x.reshape(B, C, -1).gather(2, idx).reshape(x.shape)
+
+
+def masked_source(x0: torch.Tensor, pixel_mask: Optional[torch.Tensor],
+                  fill_holes: bool = False) -> torch.Tensor:
+    """The X_0 that apply_map fetches from.
+
+    fill_holes=False reproduces the original behaviour exactly (zero out non-fluid);
+    True substitutes nearest-fluid ghost values instead.  Fluid pixels are untouched
+    either way, and the loss stays masked to fluid, so filled values are never
+    supervised -- they only stop the sampler returning a wrong number.
+    """
+    if pixel_mask is None:
+        return x0
+    if not fill_holes:
+        return x0 * pixel_mask[:, :1]
+    return apply_fill(x0, fill_index_for(pixel_mask))
+
+
 def compose(disp_prev: torch.Tensor, gain_prev: torch.Tensor,
             disp_inc: torch.Tensor, gain_inc: torch.Tensor
             ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -156,11 +239,14 @@ class _MapLevel(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def forward(self, slots, out_hw):
+    def forward(self, slots, out_hw, disp_scale: float = 1.0):
         cfg = self.cfg
         B = slots.shape[0]
         m = self.m
         H, W = out_hw
+        # A d-step jump displaces ~d x further than a 1-step one, so the bound has to
+        # open up with d or tanh saturates and large deltas simply cannot be expressed.
+        max_disp = self.max_disp * disp_scale
         q = self.query.expand(B, m * m, -1) + self.pos
         for layer in self.layers:
             q = layer(q, slots)
@@ -170,13 +256,13 @@ class _MapLevel(nn.Module):
         gain = None
         if cfg.warp_divfree:
             h = 2.0 / m
-            A = self.max_disp * h / 2.0
+            A = max_disp * h / 2.0
             disp_lo = _curl(A * torch.tanh(raw[:, :1]), h)
             if self.is_base:
-                trans = self.max_disp * torch.tanh(raw[:, 1:3].mean(dim=(2, 3)))
+                trans = max_disp * torch.tanh(raw[:, 1:3].mean(dim=(2, 3)))
                 gain_raw = raw[:, 3:]
         else:
-            disp_lo = self.max_disp * torch.tanh(raw[:, :2])
+            disp_lo = max_disp * torch.tanh(raw[:, :2])
             gain_raw = raw[:, 2:] if self.is_base else None
         disp = F.interpolate(disp_lo, size=(H, W), mode='bilinear', align_corners=False)
         if trans is not None:
@@ -226,7 +312,8 @@ class WarpMapHead(nn.Module):
         self.last_level_mags: list = []
 
     def forward(self, slots: torch.Tensor,
-                out_hw: Optional[Tuple[int, int]] = None
+                out_hw: Optional[Tuple[int, int]] = None,
+                disp_scale: float = 1.0
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         H, W = out_hw if out_hw is not None else cfg.img_hw
@@ -245,7 +332,7 @@ class WarpMapHead(nn.Module):
         # only — cached for the trainer to add as cfg.warp_level_l2 * this
         self.last_level_penalty = slots.new_zeros(())
         for i, lvl in enumerate(self.levels[:n_act]):
-            d, g, trans = lvl(slots, (H, W))
+            d, g, trans = lvl(slots, (H, W), disp_scale)
             disp_total = d if disp_total is None else disp_total + d
             if i == 0:
                 gain = g
@@ -274,7 +361,7 @@ class WarpDecoder(nn.Module):
 
     def step(self, latent: torch.Tensor, D: torch.Tensor, G: torch.Tensor,
              x0m: torch.Tensor, use_detail: bool = True,
-             freeze_transport: bool = False):
+             freeze_transport: bool = False, disp_scale: float = 1.0):
         """One rollout decode step.
 
         latent [B, n_slots, d] (increment code) → compose the new increment onto
@@ -284,7 +371,7 @@ class WarpDecoder(nn.Module):
         cfg = self.cfg
         H, W = x0m.shape[-2:]
         nt = cfg.n_transport_slots
-        d, g = self.map_head(latent[:, :nt], out_hw=(H, W))
+        d, g = self.map_head(latent[:, :nt], out_hw=(H, W), disp_scale=disp_scale)
         d, g = d.float(), g.float()
         if freeze_transport:
             d, g = d.detach(), g.detach()

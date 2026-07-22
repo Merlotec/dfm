@@ -53,6 +53,13 @@ class DFMConfig:
                                  # every matching basin; composition reaches far
     warp_gain_range: float = 0.5 # per-step gain range (composite grows by product)
     warp_divfree: bool = True    # disp = curl(stream fn) + uniform mean flow
+    # Ghost cells for displacements that fetch from OUTSIDE the fluid: fill
+    # non-fluid pixels of X_0 with their nearest fluid value (Neumann) instead of
+    # the masked-out 0 -- which, post-normalisation, is the dataset mean, i.e.
+    # ~free-stream velocity injected into a boundary layer.  Static per geometry,
+    # so it costs one cached gather per window.  See warp.build_fill_index.
+    # NOTE: changes the transport solution -- stage A must be retrained, not resumed.
+    warp_fill_holes: bool = True
     warp_head_layers: int = 2
 
     # --- flow pyramid (coarse->fine displacement) ------------------------------
@@ -86,6 +93,20 @@ class DFMConfig:
     # residual; the discriminator activates here (gan_start_step in train_ae.py
     # should be >= warp_stage_a_steps).
     warp_stage_a_steps: int = 8000
+
+    # --- mixed-delta curriculum -------------------------------------------------
+    # The encoder is a PAIR encoder: encode(X_t, X_{t+d}) -> the increment code for
+    # that jump.  With d==1 everywhere the latent can only ever mean "one step".
+    # Partitioning the window into random segments d_i (sum = K) instead lets one
+    # latent represent an ARBITRARY d-step evolution, so phase 2 can jump several
+    # frames at once; because different partitions of the same window must reach the
+    # same endpoints, this also pins the semigroup property (a d=k latent behaves
+    # like k composed d=1 latents).  d_max ramps 1 -> ae_max_delta over this many
+    # steps; 0 DISABLES the curriculum (d==1 always == the pre-curriculum model).
+    # Two things scale with d and must stay in sync (see _seq_pass):
+    #   * the flow aux target — alpha is calibrated PER FRAME, so it needs d*alpha
+    #   * the |disp| bound    — a d-step jump moves ~d x further than a 1-step one
+    warp_delta_ramp_steps: int = 0
 
     # --- flow-over-generation learning aids ------------------------------------
     # (1) velocity supervision: the data OBSERVES the flow; an annealed aux loss

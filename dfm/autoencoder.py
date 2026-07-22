@@ -29,7 +29,8 @@ from .modules import (PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SelfAttnBl
                       sincos_2d, add_relative_noise)
 from .discriminator import DFMDiscriminator
 from .losses import FluidLoss
-from .warp import WarpDecoder, apply_map, compose, gated_recon_loss, identity_map
+from .warp import (WarpDecoder, apply_map, compose, gated_recon_loss, identity_map,
+                   masked_source)
 
 
 def remap_ae_pyramid_keys(sd: dict) -> dict:
@@ -222,6 +223,33 @@ class AutoencoderTrainer:
                    / max(1, self.gan_ramp_steps))
         return self.cfg.disc_adv_weight * ramp
 
+    def _delta_max(self) -> int:
+        """Curriculum cap on the per-segment jump size d (1 => the original model).
+
+        Linear ramp 1 -> ae_max_delta over warp_delta_ramp_steps, so transport settles
+        on easy one-step maps before it has to represent multi-frame jumps.
+        """
+        cfg = self.cfg
+        if cfg.warp_delta_ramp_steps <= 0:
+            return 1
+        frac = min(1.0, self.global_step / cfg.warp_delta_ramp_steps)
+        return max(1, min(cfg.ae_max_delta, int(1 + frac * (cfg.ae_max_delta - 1))))
+
+    @staticmethod
+    def _partition(K: int, d_max: int) -> list:
+        """Random partition of [0, K] into segments (start, d) with sum(d) == K.
+
+        d_max == 1 reproduces the consecutive-pair loop exactly.  Every segment
+        endpoint is a real frame, so each one is directly supervisable.
+        """
+        segs, t = [], 0
+        while t < K:
+            hi = min(d_max, K - t)
+            d  = 1 if hi <= 1 else int(torch.randint(1, hi + 1, (1,)).item())
+            segs.append((t, d))
+            t += d
+        return segs
+
     def _flow_aux_weight(self) -> float:
         cfg = self.cfg
         if (cfg.warp_flow_aux_weight <= 0 or cfg.warp_flow_aux_steps <= 0
@@ -252,7 +280,7 @@ class AutoencoderTrainer:
         stage_b = detail_head is not None and self.global_step >= cfg.warp_stage_a_steps
         B, K1, C, H, W = frames.shape
         K = K1 - 1
-        x0m = frames[:, 0] * pixel_mask[:, :1] if pixel_mask is not None else frames[:, 0]
+        x0m = masked_source(frames[:, 0], pixel_mask, cfg.warp_fill_holes)
 
         freeze = training and not stage_b and self.global_step < cfg.warp_gain_freeze_steps
         aux_w = self._flow_aux_weight() if (training and not stage_b) else 0.0
@@ -286,12 +314,17 @@ class AutoencoderTrainer:
         # of the cost. The warp math now stays in bf16-mixed on PVC.
         _ac = torch.autocast(device_type=frames.device.type, dtype=torch.bfloat16,
                              enabled=amp)
-        for s in range(1, K1):
+        # Mixed-delta curriculum: partition the window into random jumps instead of
+        # always stepping s-1 -> s, so ONE latent can mean "advance d frames".
+        # Validation stays at d == 1 so val_recon is comparable across the ramp.
+        segments = self._partition(K, self._delta_max() if training else 1)
+        for (t0, dl) in segments:
+          s = t0 + dl                                   # target frame for this segment
           with _ac:
-            latent = ae.encode(frames[:, s - 1], frames[:, s], pixel_mask)
+            latent = ae.encode(frames[:, t0], frames[:, s], pixel_mask)
             if training:
                 latent = add_relative_noise(latent, cfg.ae_decode_noise_std)
-            d, g = map_head(latent[:, :nt], out_hw=(H, W))
+            d, g = map_head(latent[:, :nt], out_hw=(H, W), disp_scale=float(dl))
             if stage_b:
                 # transport frozen: stage-B loss must not reshape the map — the
                 # "cannot replace" guarantee is this detach plus stage A itself
@@ -309,8 +342,11 @@ class AutoencoderTrainer:
             if aux_w > 0:
                 # backward fetch ≈ upstream: d(p) ≈ −α ⊙ v_phys(p) — physics as
                 # scaffolding, annealed away by _flow_aux_weight
+                # alpha is calibrated PER FRAME, so a d-step jump expects d*alpha —
+                # without this the aux loss drags every multi-frame jump back toward
+                # a single-step displacement and fights the delta curriculum.
                 v_phys = frames[:, s, vc] * v_std + v_mean
-                aux_sum = aux_sum + ((d + alpha * v_phys) ** 2).mean()
+                aux_sum = aux_sum + ((d + dl * alpha * v_phys) ** 2).mean()
             D, G = compose(D, G, d, g)
             xhat = apply_map(x0m, D, G)
             if stage_b:
@@ -334,11 +370,15 @@ class AutoencoderTrainer:
                     l1_weight=self.criterion.l1_weight, window=cfg.warp_gate_window,
                     lam_d=cfg.warp_gate_lambda_d * lam_scale,
                     lam_g=cfg.warp_gate_lambda_g * lam_scale,
-                    max_disp=map_head.max_disp, gain_range=map_head.gain_range,
+                    max_disp=map_head.max_disp * dl, gain_range=map_head.gain_range,
                     pixel_mask=pixel_mask)
             else:
                 grad_sum = grad_sum + step_report
-        return (report_sum / K, grad_sum / K, reg_sum / K, aux_sum / K,
+        # normalise by SEGMENTS, not K — a partition with larger jumps has fewer
+        # supervised endpoints, and dividing by K would silently shrink the loss
+        # (and the gradient) as the delta curriculum ramps up.
+        n_seg = len(segments)
+        return (report_sum / n_seg, grad_sum / n_seg, reg_sum / n_seg, aux_sum / n_seg,
                 xhat, frames[:, K])
 
     # ---- training step --------------------------------------------------------

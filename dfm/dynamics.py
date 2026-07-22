@@ -29,7 +29,7 @@ from .autoencoder import LatentAutoencoder
 from .config import DFMConfig
 from .evolution import EvolutionOperator
 from .losses import FluidLoss
-from .warp import identity_map
+from .warp import identity_map, masked_source
 
 
 class RolloutTrainer:
@@ -78,7 +78,7 @@ class RolloutTrainer:
         cfg = self.cfg
         B, _, C, H, W = frames.shape
         x0 = frames[:, 0]
-        x0m = x0 * pixel_mask[:, :1] if pixel_mask is not None else x0
+        x0m = masked_source(x0, pixel_mask, cfg.warp_fill_holes)
 
         with torch.no_grad():                       # frozen AE: teachers + seed
             L = self.ae.encode(x0, x0, pixel_mask)  # zero-motion seed
@@ -146,7 +146,7 @@ class RolloutTrainer:
         """Inference: X_0 → n_steps decoded frames (no ground truth needed)."""
         self.evo.eval()
         B, C, H, W = x0.shape
-        x0m = x0 * pixel_mask[:, :1] if pixel_mask is not None else x0
+        x0m = masked_source(x0, pixel_mask, self.cfg.warp_fill_holes)
         L = self.ae.encode(x0, x0, pixel_mask)
         amp = x0.device.type in ('cuda', 'xpu')
         D, G = identity_map(B, C, H, W, x0.device, torch.bfloat16 if amp else torch.float32)
