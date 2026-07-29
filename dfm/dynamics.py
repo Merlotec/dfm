@@ -75,6 +75,8 @@ class RolloutTrainer:
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
         sd = remap_ae_pyramid_keys(strip_compile_prefix(ckpt['ae']))
         missing, unexpected = self.ae.load_state_dict(sd, strict=False)
+        # norm_* buffers are expected to be absent in pre-buffer AE checkpoints.
+        missing = [k for k in missing if not k.startswith('norm_')]
         # strict=False is needed for the pyramid remap, but it also means a genuine
         # architecture mismatch loads NOTHING and trains the dynamics against a
         # randomly-initialised decoder, silently.  Say so instead.

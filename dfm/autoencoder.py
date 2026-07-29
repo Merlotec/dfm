@@ -144,7 +144,22 @@ class LatentAutoencoder(nn.Module):
         self.cfg = cfg
         self.encoder = PairEncoder(cfg)
         self.decoder = WarpDecoder(cfg)
+        # Normalisation stats travel WITH the weights (persistent buffers -> in
+        # state_dict), because the model was trained to receive inputs on this
+        # scale: the stats are part of its contract, not a detachable sidecar.
+        # norm_set flips to 1 once real stats are installed; a legacy checkpoint
+        # loads it as 0 (strict=False) so inference knows to fall back to a file.
+        C = cfg.in_channels
+        self.register_buffer('norm_mean', torch.zeros(C))
+        self.register_buffer('norm_std',  torch.ones(C))
+        self.register_buffer('norm_set',  torch.zeros(()))
         self._init_weights()
+
+    def set_norm_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Install the training normalisation so it persists in the checkpoint."""
+        self.norm_mean.copy_(mean.detach().float().view(-1))
+        self.norm_std.copy_(std.detach().float().view(-1))
+        self.norm_set.fill_(1.0)
 
     def encode(self, xa, xb, pixel_mask=None):
         return self.encoder(xa, xb, pixel_mask)
@@ -196,6 +211,8 @@ class AutoencoderTrainer:
         self.norm_std  = norm_stats[1].detach().clone().float() if norm_stats else None
         self.cfg           = cfg
         self.ae            = LatentAutoencoder(cfg)
+        if norm_stats is not None:                 # bake the stats into the weights
+            self.ae.set_norm_stats(norm_stats[0], norm_stats[1])
         self.discriminator = DFMDiscriminator(cfg)
         self.criterion     = FluidLoss(l1_weight, pixel_mask=pixel_mask)
         self.clip_grad     = clip_grad

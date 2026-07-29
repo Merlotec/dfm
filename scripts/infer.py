@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from typing import Optional
 import sys
 from pathlib import Path
 
@@ -40,11 +41,28 @@ from dfm.distributed import pick_device
 _ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_stats(data_dir: Path):
-    """(mean, std) [C] from the dataset's hfm_input_stats.json (same file training used)."""
-    with open(data_dir / 'hfm_input_stats.json') as f:
-        s = json.load(f)
-    return torch.tensor(s['mean']), torch.tensor(s['std'])
+def load_stats(data_dir: Path, stats: Optional[Path] = None):
+    """(mean, std) [C] normalisation stats.
+
+    MUST be the stats the AE was TRAINED with -- the model expects inputs on that
+    scale, so a fresh validation set must NOT use its own stats.  Search order:
+    explicit --stats (file or dir), then data_dir, then a mesh_*/ subdir of it.
+    """
+    tried = []
+    for cand in ([stats, stats / 'hfm_input_stats.json' if stats else None,
+                  data_dir / 'hfm_input_stats.json']
+                 + sorted(data_dir.glob('*/hfm_input_stats.json'))):
+        if cand is None:
+            continue
+        tried.append(str(cand))
+        if cand.is_file():
+            with open(cand) as f:
+                s = json.load(f)
+            return torch.tensor(s['mean']), torch.tensor(s['std'])
+    raise SystemExit(
+        'No hfm_input_stats.json found. Inference must use the TRAINING stats -- '
+        'pass --stats <training-data-dir> (e.g. ../data/fvm_gen_datasets).\n'
+        '  looked in: ' + ', '.join(tried))
 
 
 @torch.no_grad()
@@ -148,31 +166,53 @@ def main():
     cfg: DFMConfig = ckpt['cfg']                          # exact trained architecture
     use_detail = not args.no_detail
 
+    # The AE weights live in the phase-1 ckpt, or (phase-2) in the --ae checkpoint.
+    is_phase2 = 'evo' in ckpt and 'ae' not in ckpt
+    if is_phase2 and args.ae is None:
+        raise SystemExit('phase-2 checkpoint needs --ae <AE checkpoint>')
+    ae_sd_src = (torch.load(args.ae, map_location='cpu', weights_only=False)['ae']
+                 if is_phase2 else ckpt['ae'])
+    ae_sd = remap_ae_pyramid_keys(strip_compile_prefix(ae_sd_src))
+
+    # Pick the detail-head class from the CHECKPOINT's keys, not from cfg: a config
+    # saved before FlowMatchHead existed unpickles with warp_detail_generative
+    # defaulting to True, which would build a FlowMatchHead and leave its noisy_embed
+    # / time_mlp at random init.  The keys say what was actually trained.
+    if cfg.n_detail_slots > 0:
+        gen = any('detail_head.noisy_embed' in k for k in ae_sd)
+        if gen != cfg.warp_detail_generative:
+            print(f'  [info] detail head from checkpoint keys: '
+                  f'{"generative (flow)" if gen else "deterministic"} '
+                  f'(cfg said {cfg.warp_detail_generative}) -- using the checkpoint')
+            cfg.warp_detail_generative = gen
+
     ae = LatentAutoencoder(cfg).to(device).eval()
+    _miss, _unexp = ae.load_state_dict(ae_sd, strict=False)
+    # norm_* buffers are expected to be absent in pre-buffer checkpoints -- don't
+    # flag them (they fall back to --stats below).
+    _miss = [k for k in _miss if not k.startswith('norm_')]
+    if _miss or _unexp:
+        print(f'  [warn] AE only partially loaded: {len(_miss)} missing, '
+              f'{len(_unexp)} unexpected keys')
+
     evo = None
-    if 'evo' in ckpt and 'ae' not in ckpt:               # phase-2 evo checkpoint
-        if args.ae is None:
-            raise SystemExit('phase-2 checkpoint needs --ae <AE checkpoint>')
-        ae_ckpt = torch.load(args.ae, map_location='cpu', weights_only=False)
-        _sd = remap_ae_pyramid_keys(strip_compile_prefix(ae_ckpt['ae']))
-        _miss, _unexp = ae.load_state_dict(_sd, strict=False)
-        if _miss or _unexp:
-            print(f'  [warn] AE only partially loaded: {len(_miss)} missing, '
-                  f'{len(_unexp)} unexpected keys')
+    if is_phase2:
         evo = EvolutionOperator(cfg).to(device).eval()
         evo.load_state_dict(strip_compile_prefix(ckpt['evo']))
         mode = 'phase-2 autonomous rollout'
-    else:                                                # phase-1 AE checkpoint
-        _sd = remap_ae_pyramid_keys(strip_compile_prefix(ckpt['ae']))
-        _miss, _unexp = ae.load_state_dict(_sd, strict=False)
-        if _miss or _unexp:
-            print(f'  [warn] AE only partially loaded: {len(_miss)} missing, '
-                  f'{len(_unexp)} unexpected keys')
+    else:
         mode = 'phase-1 teacher-forced reconstruction'
     print(f'device={device}  mode={mode}  detail={use_detail}  '
           f'pyramid_levels={cfg.warp_pyramid_levels}')
 
-    mean, std = load_stats(args.data)
+    # Prefer the normalisation baked into the checkpoint; fall back to a file only
+    # for legacy (pre-buffer) checkpoints.
+    if bool(ae.norm_set.item()):
+        mean, std = ae.norm_mean.cpu(), ae.norm_std.cpu()
+        print('  [stats] normalisation baked into the checkpoint')
+    else:
+        mean, std = load_stats(args.data, args.stats)
+        print('  [stats] legacy checkpoint -> loaded from file / --stats')
     mean_d, std_d = mean.view(-1, 1, 1), std.view(-1, 1, 1)
 
     # mesh discovery (flat single-mesh dir, or a dir of mesh_*/ subdirs)

@@ -75,10 +75,25 @@ def main():
     num_workers  = args.num_workers if args.num_workers is not None else train_hp.get('num_workers', 4)
     cache_frames = train_hp.get('cache_frames', False)
 
+    # The frozen AE defines the latent space, so phase 2 MUST normalise inputs with
+    # the SAME stats the AE was trained on -- take them straight from the AE
+    # checkpoint (baked in as buffers) rather than recomputing from the data dir,
+    # which could silently differ.  Legacy AE (no baked stats) -> datamodule computes.
+    _ae_sd = torch.load(args.ae, map_location='cpu', weights_only=False)['ae']
+    if 'norm_set' in _ae_sd and float(_ae_sd['norm_set']) == 1.0:
+        ae_mean, ae_std = _ae_sd['norm_mean'].clone(), _ae_sd['norm_std'].clone()
+        print(f'Normalisation: from AE checkpoint (baked) '
+              f'mean={[round(x,2) for x in ae_mean.tolist()]}')
+    else:
+        ae_mean = ae_std = None
+        print('Normalisation: AE has no baked stats (legacy) -> computed from data')
+    del _ae_sd
+
     # pred window = [X_0, X_1, ..., X_{horizon_max}]  (the anchored sequence).
     dm = FVMDataModule(args.data, n_context=cfg.n_context_frames, horizon=cfg.horizon_max,
                        batch_size=batch_size, num_workers=num_workers,
-                       cache_frames=cache_frames, random_context=True, return_index=False)
+                       cache_frames=cache_frames, random_context=True, return_index=False,
+                       mean=ae_mean, std=ae_std)
     dm.setup()
     assert dm._dataset is not None
     steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)

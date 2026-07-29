@@ -13,5 +13,5 @@ set -euo pipefail
 CKPT="${1:?usage: infer.sh <checkpoint.pt> [--ae AE.pt] [--n-predict N] [--n-runs N] ...}"
 shift
 cd "$(dirname "$0")/.."
-exec python scripts/infer.py --checkpoint "$CKPT" --data ../data/test \
+exec python scripts/infer.py --checkpoint "$CKPT" --data ../data/fvm_validation \
      --out-dir out/infer "$@"
