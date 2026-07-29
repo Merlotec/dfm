@@ -132,7 +132,8 @@ class RolloutTrainer:
             # detach: the detail heads must not reshape transport or evo (same
             # boosting-style identifiability the old stage A/B split gave us).
             ml, fl, _ = self.detail.losses(xhat.detach(), L.detach(),
-                                           frames[:, s], pixel_mask)
+                                           frames[:, s], pixel_mask,
+                                           grad_checkpoint=cfg.grad_checkpoint and training)
             mean_sum = mean_sum + ml
             flow_sum = flow_sum + fl
         self.last_mean_loss = float(mean_sum.detach() / K)

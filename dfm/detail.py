@@ -234,15 +234,36 @@ class DetailGenerator(nn.Module):
         return rho * z + (1.0 - rho ** 2).sqrt() * torch.randn_like(z)
 
     def losses(self, resolved: torch.Tensor, state: torch.Tensor,
-               target: torch.Tensor, pixel_mask: Optional[torch.Tensor] = None
+               target: torch.Tensor, pixel_mask: Optional[torch.Tensor] = None,
+               grad_checkpoint: bool = False
                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(mean_loss, flow_loss, mean_residual) for one step.
 
         resolved/target are grad-free w.r.t. the AE (it is frozen).  The mean head
         is detached out of the fluctuation target so the two heads do not fight:
         the flow head models the residual AROUND whatever the mean head predicts.
+
+        grad_checkpoint recomputes each head in backward instead of keeping its
+        activations: both heads run r*r (=4096 at detail_res 64) query tokens at
+        d_model, on EVERY one of the K rollout steps, and all of it is retained for
+        BPTT -- that product, not the full-res fields, is what dominates phase-2
+        memory (~4.8 GB of the two heads at B=32,K=6 vs ~0.8 GB for transport).
         """
         r_full = target - resolved
+        hw = r_full.shape[-2:]
+        if grad_checkpoint and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint
+            r_mean = checkpoint(lambda a, b: self.mean_head(a, b, pixel_mask, out_hw=hw),
+                                resolved, state, use_reentrant=False)
+            fluct = r_full - r_mean.detach()
+            flow_loss = checkpoint(
+                lambda a, b, c: self.flow_head.flow_loss(a, b, c, pixel_mask),
+                resolved, state, fluct, use_reentrant=False)
+            w = pixel_mask[:, :1].to(r_full.dtype) if pixel_mask is not None else None
+            se = (r_mean.float() - r_full.float()) ** 2
+            mean_loss = ((se * w).sum() / w.expand_as(se).sum().clamp_min(1.0)
+                         if w is not None else se.mean())
+            return mean_loss, flow_loss, r_mean
         r_mean = self.mean_head(resolved, state, pixel_mask, out_hw=r_full.shape[-2:])
         w = pixel_mask[:, :1].to(r_full.dtype) if pixel_mask is not None else None
         se = (r_mean.float() - r_full.float()) ** 2

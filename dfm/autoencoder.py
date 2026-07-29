@@ -406,13 +406,34 @@ class AutoencoderTrainer:
         # Validation stays at d == 1 so val_recon is comparable across the ramp.
         segments = self._partition(K, self._delta_max() if training else 1)
         self.last_segments = segments      # persistence_baseline scores the SAME frames
+        # Recompute encode+map_head in backward instead of retaining them.  The map
+        # head runs sum(res_i^2) query tokens per segment -- 1024+4096+16384 = 21504
+        # at 3 pyramid levels -- at d_model, on EVERY segment, all held for BPTT
+        # through the composed map.  That product dominates phase-1 memory.
+        # last_level_penalty must be RETURNED, not read off the module afterwards:
+        # under checkpointing the attribute set during the forward pass has no live
+        # graph, so reading it there would silently stop training the level penalty.
+        def _encode_map(f_a, f_b, dl_f):
+            lat = ae.encode(f_a, f_b, pixel_mask)
+            if training:
+                lat = add_relative_noise(lat, cfg.ae_decode_noise_std)
+            dd, gg = map_head(lat[:, :nt], out_hw=(H, W), disp_scale=float(dl_f))
+            pen = map_head.last_level_penalty
+            return lat, dd, gg, pen
+
+        use_ckpt = training and cfg.grad_checkpoint and torch.is_grad_enabled()
         for (t0, dl) in segments:
           s = t0 + dl                                   # target frame for this segment
           with _ac:
-            latent = ae.encode(frames[:, t0], frames[:, s], pixel_mask)
-            if training:
-                latent = add_relative_noise(latent, cfg.ae_decode_noise_std)
-            d, g = map_head(latent[:, :nt], out_hw=(H, W), disp_scale=float(dl))
+            if use_ckpt:
+                from torch.utils.checkpoint import checkpoint
+                # preserve_rng_state (default) makes add_relative_noise reproduce the
+                # SAME noise on recompute, so this stays numerically exact.
+                latent, d, g, level_pen = checkpoint(
+                    _encode_map, frames[:, t0], frames[:, s], float(dl),
+                    use_reentrant=False)
+            else:
+                latent, d, g, level_pen = _encode_map(frames[:, t0], frames[:, s], float(dl))
             if stage_b:
                 # transport frozen: stage-B loss must not reshape the map — the
                 # "cannot replace" guarantee is this detach plus stage A itself
@@ -426,7 +447,7 @@ class AutoencoderTrainer:
                 # which the loss re-scales by warp_gain_l1.  Stage-A only: in stage
                 # B the map is frozen, so this must not train it.
                 if cfg.warp_level_l2 > 0:
-                    grad_sum = grad_sum + cfg.warp_level_l2 * map_head.last_level_penalty
+                    grad_sum = grad_sum + cfg.warp_level_l2 * level_pen
             if aux_w > 0:
                 # backward fetch ≈ upstream: d(p) ≈ −α ⊙ v_phys(p) — physics as
                 # scaffolding, annealed away by _flow_aux_weight
