@@ -90,12 +90,27 @@ class DFMConfig:
     # (finer penalized MORE — smooth flow is the default, fine structure earns its
     # place).  0 disables.  Applied in the trainer via map_head.last_level_mags.
     warp_level_l2: float = 0.0
+    # How much HARDER each finer pyramid level is penalised than the one above it:
+    # per-level weight is (i+1)^warp_level_penalty_exp.  1.0 = linear (level 1 ×2,
+    # level 2 ×3 ...); 0.0 = every level weighted equally (finer levels free to
+    # differ as much as coarser ones); <1 softens, >1 sharpens the bias toward
+    # smooth/coarse flow.  See WarpMapHead.forward.
+    warp_level_penalty_exp: float = 1.0
 
-    # --- closure (DetailHead) --------------------------------------------------
+    # --- closure (detail head) -------------------------------------------------
     warp_detail_res: int = 64
     grad_checkpoint: bool = True   # recompute the per-step DetailHead in
                                    # backward (stage-B memory; see _seq_pass)
     warp_detail_range: float = 1.0
+    # Generative closure: the subgrid residual is stochastic (many fine-scale
+    # realisations fit the same convected frame), so a deterministic L1 head
+    # regresses to the blurry MEAN or memorises.  FlowMatchHead instead learns
+    # p(residual | convected frame, detail slots) and SAMPLES a sharp realisation
+    # -- a conditional flow-matching (rectified-flow) model.  Loss is MSE on the
+    # velocity, not on the residual, so sampling gives sharp draws.  See
+    # warp.FlowMatchHead.  False keeps the deterministic DetailHead.
+    warp_detail_generative: bool = True
+    warp_flow_steps: int = 8       # Euler steps for the sampler at inference
 
     # --- staged training -------------------------------------------------------
     # Stage A (step < warp_stage_a_steps): transport only, DetailHead absent.

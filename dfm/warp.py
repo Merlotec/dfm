@@ -36,6 +36,7 @@ and the accumulator holds the unbounded-complexity composite.
 """
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -440,8 +441,13 @@ class WarpMapHead(nn.Module):
         disp_total = None
         gain = None
         self.last_level_mags = []
-        # differentiable per-level penalty, finer weighted more (i+1), fine levels
-        # only — cached for the trainer to add as cfg.warp_level_l2 * this
+        # differentiable per-level penalty (the trainer adds it as cfg.warp_level_l2 *
+        # this).  Per level it is (i+1)^exp · mean(d_i²) -- the mean-square, i.e. the
+        # POWER, of that level's own displacement field (finer levels are ~zero-mean
+        # curl, so mean-square ≈ variance).  The (i+1)^exp weight penalises finer
+        # levels progressively harder; warp_level_penalty_exp tunes how much harder
+        # (1.0 = linear i+1, 0.0 = every level weighted equally).
+        exp = cfg.warp_level_penalty_exp
         self.last_level_penalty = slots.new_zeros(())
         for i, lvl in enumerate(self.levels[:n_act]):
             d, g, trans = lvl(slots, (H, W), disp_scale)
@@ -452,7 +458,7 @@ class WarpMapHead(nn.Module):
                 self.last_curl_mag = float((d - (trans.view(-1, 2, 1, 1) if trans is not None else 0.0)
                                             ).detach().abs().mean())
             else:
-                self.last_level_penalty = self.last_level_penalty + (i + 1) * (d ** 2).mean()
+                self.last_level_penalty = self.last_level_penalty + ((i + 1) ** exp) * (d ** 2).mean()
             self.last_level_mags.append(float(d.detach().abs().mean()))
         return disp_total, gain
 
@@ -469,7 +475,12 @@ class WarpDecoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.map_head = WarpMapHead(cfg)
-        self.detail_head = DetailHead(cfg) if cfg.n_detail_slots > 0 else None
+        if cfg.n_detail_slots <= 0:
+            self.detail_head = None
+        elif cfg.warp_detail_generative:
+            self.detail_head = FlowMatchHead(cfg)
+        else:
+            self.detail_head = DetailHead(cfg)
 
     def step(self, latent: torch.Tensor, D: torch.Tensor, G: torch.Tensor,
              x0m: torch.Tensor, use_detail: bool = True,
@@ -490,7 +501,11 @@ class WarpDecoder(nn.Module):
         D, G = compose(D, G, d, g)
         xhat = apply_map(x0m, D, G)
         if use_detail and self.detail_head is not None:
-            xhat = xhat + self.detail_head(latent[:, nt:], xhat, out_hw=(H, W)).float()
+            if isinstance(self.detail_head, FlowMatchHead):
+                res = self.detail_head.sample(latent[:, nt:], xhat, out_hw=(H, W))
+            else:
+                res = self.detail_head(latent[:, nt:], xhat, out_hw=(H, W))
+            xhat = xhat + res.float()
         return xhat, D, G
 
 
@@ -550,6 +565,123 @@ class DetailHead(nn.Module):
         res = self.head(q).permute(0, 2, 1).reshape(B, -1, r, r)
         res = F.interpolate(res, size=(H, W), mode='bilinear', align_corners=False)
         return cfg.warp_detail_range * torch.tanh(res)
+
+
+def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
+    """Sinusoidal embedding of a [B] flow time in [0,1] -> [B, dim]."""
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device) / max(1, half))
+    a = t.float()[:, None] * freqs[None] * (2 * math.pi)
+    emb = torch.cat([a.cos(), a.sin()], dim=-1)
+    if emb.shape[-1] < dim:                       # odd dim: pad one column
+        emb = F.pad(emb, (0, dim - emb.shape[-1]))
+    return emb
+
+
+class FlowMatchHead(nn.Module):
+    """Generative closure: samples the subgrid residual instead of regressing it.
+
+    The residual r = X_s - convected(X_0) is stochastic given the convected frame,
+    so a deterministic head can only hit its (blurry) mean or memorise per-sample
+    detail.  This head learns a CONDITIONAL FLOW between noise and the residual --
+    rectified flow / flow matching -- conditioned on the convected frame and the
+    detail slots, and SAMPLES a sharp realisation.
+
+    Same cross-attention core as DetailHead, plus: the current noisy residual r_t
+    and the flow time t are fed in, and the head predicts a VELOCITY (not the
+    residual).  Training loss is MSE on that velocity (see flow_loss) -- still an
+    L2, but on the transport velocity between noise and data, which is score
+    matching, so sampling recovers the distribution rather than the mean.  Runs at
+    cfg.warp_detail_res (residual modelled up to that resolution, then upsampled).
+
+    The detail slots only CONDITION the distribution; the realisation comes from
+    the sampler's noise, so the encoder cannot cram the exact residual into them --
+    they stay a smooth, low-dim, evo-predictable descriptor (the property phase 2
+    needs, and the one the deterministic head destroyed).
+    """
+
+    pos: torch.Tensor
+
+    def __init__(self, cfg: DFMConfig):
+        super().__init__()
+        self.cfg = cfg
+        r = cfg.warp_detail_res
+        C = cfg.in_channels
+        d = cfg.d_model
+
+        self.query = nn.Parameter(torch.zeros(1, 1, d))
+        self.register_buffer('pos', sincos_2d(r, r, d).unsqueeze(0), persistent=False)
+        self.cond_embed  = nn.Conv2d(C, d, kernel_size=1)      # convected frame
+        self.noisy_embed = nn.Conv2d(C, d, kernel_size=1)      # current noisy residual r_t
+        self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, d))
+        self.layers = nn.ModuleList([
+            CrossAttnBlock(d, d, cfg.n_heads, cfg.ae_mlp, cfg.dropout)
+            for _ in range(cfg.warp_head_layers)
+        ])
+        self.head = nn.Linear(d, C)
+        nn.init.trunc_normal_(self.query, std=0.02)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)                          # velocity ~ 0 at init
+
+    def _velocity(self, r_t: torch.Tensor, t: torch.Tensor, cond_r: torch.Tensor,
+                  detail_slots: torch.Tensor) -> torch.Tensor:
+        """All inputs already at the working resolution r×r.  -> velocity [B,C,r,r]."""
+        B, _, r, _ = r_t.shape
+        c = self.cond_embed(cond_r).flatten(2).transpose(1, 2)     # [B, r*r, d]
+        n = self.noisy_embed(r_t).flatten(2).transpose(1, 2)       # [B, r*r, d]
+        temb = self.time_mlp(timestep_embedding(t, self.cfg.d_model))  # [B, d]
+        q = self.query.expand(B, r * r, -1) + self.pos + c + n + temb[:, None, :]
+        for layer in self.layers:
+            q = layer(q, detail_slots)
+        return self.head(q).permute(0, 2, 1).reshape(B, -1, r, r)
+
+    def _coarse_mask(self, pixel_mask: Optional[torch.Tensor], B: int,
+                     device, dtype) -> torch.Tensor:
+        r = self.cfg.warp_detail_res
+        if pixel_mask is None:
+            return torch.ones(B, 1, r, r, device=device, dtype=dtype)
+        w = pixel_mask[:, :1].to(dtype)
+        if w.shape[0] != B:
+            w = w.expand(B, -1, -1, -1)
+        return F.adaptive_avg_pool2d(w, (r, r))          # soft fluid fraction per cell
+
+    def flow_loss(self, detail_slots: torch.Tensor, cond: torch.Tensor,
+                  target_residual: torch.Tensor,
+                  pixel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Rectified-flow loss ‖v_θ(r_t,t) - (r1 - r0)‖² over fluid, at res r.
+
+        r1 = data residual, r0 ~ N(0,I), r_t = (1-t)·r0 + t·r1.  cond = convected
+        frame (detach upstream; the map is frozen in stage B anyway)."""
+        r = self.cfg.warp_detail_res
+        B = cond.shape[0]
+        r1 = F.adaptive_avg_pool2d(target_residual, (r, r))
+        cond_r = F.adaptive_avg_pool2d(cond, (r, r))
+        w = self._coarse_mask(pixel_mask, B, r1.device, r1.dtype)
+        r0 = torch.randn_like(r1)
+        t = torch.rand(B, device=r1.device, dtype=r1.dtype)
+        r_t = (1 - t[:, None, None, None]) * r0 + t[:, None, None, None] * r1
+        v = self._velocity(r_t, t, cond_r, detail_slots)
+        # reduce in fp32 -- runs under bf16 autocast, and the sum is over r*r*C terms
+        se = (v.float() - (r1 - r0).float()) ** 2
+        w = w.float()
+        return (se * w).sum() / w.expand_as(se).sum().clamp_min(1.0)
+
+    def sample(self, detail_slots: torch.Tensor, cond: torch.Tensor,
+               out_hw: Optional[Tuple[int, int]] = None,
+               n_steps: Optional[int] = None) -> torch.Tensor:
+        """Integrate the ODE dr/dt = v_θ from noise (t=0) to residual (t=1)."""
+        cfg = self.cfg
+        r = cfg.warp_detail_res
+        H, W = out_hw if out_hw is not None else cfg.img_hw
+        n_steps = n_steps or cfg.warp_flow_steps
+        B = detail_slots.shape[0]
+        cond_r = F.adaptive_avg_pool2d(cond, (r, r))
+        x = torch.randn(B, cfg.in_channels, r, r, device=cond.device, dtype=cond.dtype)
+        dt = 1.0 / n_steps
+        for i in range(n_steps):
+            t = torch.full((B,), i * dt, device=cond.device, dtype=cond.dtype)
+            x = x + dt * self._velocity(x, t, cond_r, detail_slots)
+        return F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
 
 
 # ---------------------------------------------------------------------------

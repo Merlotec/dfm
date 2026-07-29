@@ -212,6 +212,7 @@ class AutoencoderTrainer:
         self.disc_update_threshold = disc_update_threshold
         self.global_step           = 0
         self.last_hole_pen         = 0.0
+        self.last_fm_loss          = 0.0
         self.last_segments         = None
 
     # ---- plumbing -------------------------------------------------------------
@@ -378,6 +379,7 @@ class AutoencoderTrainer:
         aux_sum    = frames.new_zeros(())
         xhat = None
         hole_acc = 0.0            # diagnostic: mean illegal-fetch penalty this window
+        fm_acc   = 0.0            # diagnostic: mean flow-matching loss this window
         # bf16 autocast on CUDA *and* XPU — the attention/head matmuls are the bulk
         # of the cost. The warp math now stays in bf16-mixed on PVC.
         _ac = torch.autocast(device_type=frames.device.type, dtype=torch.bfloat16,
@@ -425,12 +427,23 @@ class AutoencoderTrainer:
                 grad_sum = grad_sum + cfg.warp_hole_penalty * hp
                 hole_acc = hole_acc + float(hp.detach())
             xhat = apply_map(x0m, D, G)
+            if stage_b and cfg.warp_detail_generative:
+                # Generative closure: don't add a residual and score it -- fit the
+                # flow-matching loss on the residual distribution.  cond + target are
+                # grad-free (transport frozen); gradient flows only to the flow head
+                # and the encoder's detail slots.  report the TRANSPORT-only recon so
+                # the logged number stays comparable; the fm loss is the trained one.
+                base = xhat
+                fm = detail_head.flow_loss(latent[:, nt:], base, frames[:, s] - base,
+                                           pixel_mask=pixel_mask)
+                grad_sum = grad_sum + fm
+                fm_acc = fm_acc + float(fm.detach())
+                report_sum = report_sum + self.criterion(base, frames[:, s])
+                continue
             if stage_b:
-                # gradient-checkpoint the DetailHead: it adds a 64x64 transformer
-                # forward on EVERY one of the ~K rollout steps, all retained for
-                # BPTT — the memory spike that OOMs the instant stage B turns on.
-                # Recompute in backward instead (transport froze here, so the only
-                # live graph is the detail path — cheap to redo).
+                # deterministic DetailHead path (warp_detail_generative=False).
+                # gradient-checkpoint it: a 64x64 transformer on every step, all
+                # retained for BPTT -- the memory spike that OOMs when stage B opens.
                 if training and cfg.grad_checkpoint:
                     from torch.utils.checkpoint import checkpoint
                     res = checkpoint(lambda ds, c: detail_head(ds, c, out_hw=(H, W)),
@@ -455,6 +468,7 @@ class AutoencoderTrainer:
         # (and the gradient) as the delta curriculum ramps up.
         n_seg = len(segments)
         self.last_hole_pen = hole_acc / max(1, n_seg)
+        self.last_fm_loss  = fm_acc / max(1, n_seg)
         return (report_sum / n_seg, grad_sum / n_seg, reg_sum / n_seg, aux_sum / n_seg,
                 xhat, frames[:, K])
 

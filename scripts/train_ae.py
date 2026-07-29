@@ -218,7 +218,8 @@ def main():
                 cm = getattr(mh, 'last_curl_mag', 0.0)
                 print(f'epoch {epoch:3d}  step {step:6d} | recon={recon:.4f} '
                       f'base={base:.4f} r/b={ratio:.2f} '
-                      f'|trans|={tm:.4f} |curl|={cm:.4f} hole={trainer.last_hole_pen:.5f}  '
+                      f'|trans|={tm:.4f} |curl|={cm:.4f} hole={trainer.last_hole_pen:.5f} '
+                      f'fm={trainer.last_fm_loss:.5f}  '
                       f'disc={disc:.4f}  adv_w={info["adv_weight"]:.3f}  |  {prof.line()}')
 
             ckpt_after = train_hp.get('checkpoint_after', 0)

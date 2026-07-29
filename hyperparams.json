@@ -27,6 +27,9 @@
     "warp_head_layers": 2,
     "warp_detail_res": 64,
     "warp_detail_range": 1.0,
+    "_detail_generative": "Stage-B closure is a conditional flow-matching sampler (warp.FlowMatchHead), not the deterministic DetailHead: the subgrid residual is stochastic, so L1 regression blurs/memorises. Trained with MSE on the flow velocity (see fm= in the step log); sampled with warp_flow_steps Euler steps at inference. Set false for the old deterministic head.",
+    "warp_detail_generative": true,
+    "warp_flow_steps": 8,
     "warp_stage_a_steps": 40000,
     "_delta_curriculum": "Mixed-delta training: the window is split into random jumps d_i (sum=K) instead of always d=1, so one latent encodes an arbitrary d-step evolution and phase 2 can jump several frames at once. d_max ramps 1 -> ae_max_delta over warp_delta_ramp_steps. 0 disables (d=1 always = pre-curriculum model). Changes the transport solution: retrain stage A, do not resume across this.",
     "warp_delta_ramp_steps": 10000,
@@ -67,7 +70,8 @@
     "warp_pyramid_levels": 3,
     "warp_level_disp_decay": 0.5,
     "warp_pyramid_unlock_steps": 6000,
-    "warp_level_l2": 0.01
+    "warp_level_l2": 0.01,
+    "warp_level_penalty_exp": 0.0
   },
   "training": {
     "batch_size": 32,
