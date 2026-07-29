@@ -211,7 +211,9 @@ def main():
                 f_b  = field / base if base > 1e-9 else float('nan')
                 print(f'epoch {epoch:3d}  step {step:6d} | field={field:.5f} '
                       f'tf={tf:.5f} base={base:.5f} f/tf={f_tf:.2f} f/b={f_b:.2f} '
-                      f'latent={latent:.5f}  |  {prof.line()}')
+                      f'latent={latent:.5f} mean={trainer.last_mean_loss:.5f} '
+                      f'flow={trainer.last_flow_loss:.5f} rho={float(trainer.detail.rho):.3f}'
+                      f'  |  {prof.line()}')
 
             ckpt_after = train_hp.get('checkpoint_after', 0)
             if ckpt_after > 0 and step > 0 and step % ckpt_after == 0:

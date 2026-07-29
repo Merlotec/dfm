@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dfm import DFMConfig, LatentAutoencoder, EvolutionOperator
 from dfm.autoencoder import remap_ae_pyramid_keys, strip_compile_prefix
 from dfm.warp import masked_source
+from dfm.detail import DetailGenerator
 from dfm.data import build_renderer, load_pixel_mask, FVMSequenceDataset
 from dfm.warp import identity_map
 from dfm.distributed import pick_device
@@ -84,9 +85,11 @@ def reconstruct(ae, frames, mask, use_detail):
 
 
 @torch.no_grad()
-def autonomous(ae, evo, frames, mask, use_detail):
-    """Phase-2 autonomous rollout from X_0. frames only supplies X_0 (and the GT for
-    scoring).  Returns preds [T,C,H,W] with pred[0] == X_0."""
+def autonomous(ae, evo, frames, mask, use_detail, detail=None, stochastic=True):
+    """Phase-2 autonomous rollout from X_0.  The AE is pure transport; `detail`
+    (a DetailGenerator) adds the deterministic mean closure and, when stochastic,
+    a sampled fluctuation whose noise seed is carried as an AR(1) process so the
+    detail is COHERENT across frames instead of flickering."""
     device = frames.device
     T, C, H, W = frames.shape
     x0 = frames[0:1]
@@ -94,9 +97,15 @@ def autonomous(ae, evo, frames, mask, use_detail):
     L = ae.encode(x0, x0, mask)
     D, G = identity_map(1, C, H, W, device, torch.float32)
     preds = [x0]
+    z = (detail.init_noise(1, device, torch.float32)
+         if (detail is not None and use_detail and stochastic) else None)
     for s in range(T - 1):
         L = evo(L, step_idx=s)
-        xhat, D, G = ae.decoder.step(L, D, G, x0m, use_detail=use_detail)
+        xhat, D, G = ae.decoder.step(L, D, G, x0m, use_detail=False)
+        if detail is not None and use_detail:
+            xhat = detail.add(xhat, L, mask, noise=z, stochastic=stochastic)
+            if z is not None:
+                z = detail.advance_noise(z)     # correlated seed -> temporal coherence
         preds.append(xhat)
     return torch.cat(preds, 0)
 
@@ -159,6 +168,9 @@ def main():
     p.add_argument('--seq-start', type=int, default=None, help='start index (default: run middle)')
     p.add_argument('--no-detail', action='store_true', help='decode transport only (skip DetailHead)')
     p.add_argument('--no-images', action='store_true', help='skip PNGs (metrics + npy only)')
+    p.add_argument('--deterministic', action='store_true',
+                   help='mean detail only (no sampled fluctuation) -- the MMSE output, '
+                        'which is what to compare on MSE-style metrics')
     args = p.parse_args()
 
     device = pick_device()
@@ -196,9 +208,15 @@ def main():
               f'{len(_unexp)} unexpected keys')
 
     evo = None
+    detail = None
     if is_phase2:
         evo = EvolutionOperator(cfg).to(device).eval()
         evo.load_state_dict(strip_compile_prefix(ckpt['evo']))
+        if 'detail' in ckpt:
+            detail = DetailGenerator(cfg).to(device).eval()
+            detail.load_state_dict(strip_compile_prefix(ckpt['detail']))
+            print(f'  [detail] generator loaded (rho={float(detail.rho):.3f}, '
+                  f'{cfg.warp_flow_steps} flow steps)')
         mode = 'phase-2 autonomous rollout'
     else:
         mode = 'phase-1 teacher-forced reconstruction'
@@ -246,7 +264,8 @@ def main():
         timestamps = [float(ds.paths[start + t].stem[2:]) for t in range(T)]
 
         if evo is not None:
-            pred = autonomous(ae, evo, frames, pmask, use_detail)
+            pred = autonomous(ae, evo, frames, pmask, use_detail, detail,
+                              stochastic=not args.deterministic)
         else:
             pred = reconstruct(ae, frames, pmask, use_detail)
 

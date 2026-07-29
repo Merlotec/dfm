@@ -7,7 +7,7 @@
     "n_mask_ch": 1,
     "d_model": 384,
     "n_slots": 128,
-    "n_detail_slots": 16,
+    "n_detail_slots": 0,
     "n_heads": 8,
     "mlp_ratio": 4.0,
     "ae_mlp": 4.0,
@@ -71,7 +71,8 @@
     "warp_level_disp_decay": 0.5,
     "warp_pyramid_unlock_steps": 6000,
     "warp_level_l2": 0.01,
-    "warp_level_penalty_exp": 0.0
+    "warp_level_penalty_exp": 0.0,
+    "_detail_moved": "Detail generation moved to the DYNAMICS model (phase 2): the AE is now pure deterministic transport. n_detail_slots=0 => no detail head, no stage B. The dynamics owns the deterministic mean-detail head + the stochastic flow head (see RolloutTrainer / DetailGenerator)."
   },
   "training": {
     "batch_size": 32,

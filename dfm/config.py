@@ -111,6 +111,17 @@ class DFMConfig:
     # warp.FlowMatchHead.  False keeps the deterministic DetailHead.
     warp_detail_generative: bool = True
     warp_flow_steps: int = 8       # Euler steps for the sampler at inference
+    # --- phase-2 detail generator (dfm/detail.py) ------------------------------
+    # The closure now lives in the DYNAMICS, conditioned on the rolled-out resolved
+    # frame (not on a teacher-forced code), split into a deterministic MeanHead
+    # (L2 -> E[r|state]) and a stochastic FlowHead (flow matching on the zero-mean
+    # fluctuation).  Weights for the two terms in the phase-2 objective:
+    detail_mean_weight: float = 1.0
+    detail_flow_weight: float = 1.0
+    # AR(1) correlation of the stochastic seed across rollout frames: rho =
+    # sigmoid(detail_noise_rho_init), learnable.  White-in-time detail (rho=0)
+    # flickers unphysically; 2.2 -> rho ~ 0.9 (correlation time ~10 frames).
+    detail_noise_rho_init: float = 2.2
 
     # --- staged training -------------------------------------------------------
     # Stage A (step < warp_stage_a_steps): transport only, DetailHead absent.

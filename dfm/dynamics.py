@@ -27,6 +27,7 @@ from dfm.distributed import host_grad_sync_enabled, allreduce_grads, allreduce_s
 
 from .autoencoder import LatentAutoencoder
 from .config import DFMConfig
+from .detail import DetailGenerator
 from .evolution import EvolutionOperator
 from .losses import FluidLoss
 from .warp import identity_map, masked_source
@@ -52,23 +53,31 @@ class RolloutTrainer:
         for p in self.ae.parameters():
             p.requires_grad_(False)
         self.evo = EvolutionOperator(cfg)
+        # The closure lives HERE now (not in the AE): conditioned on the rolled-out
+        # resolved frame, so it must generalise rather than decode a teacher code.
+        self.detail = DetailGenerator(cfg)
         self.criterion = FluidLoss(l1_weight, pixel_mask=pixel_mask)
         self.clip_grad = clip_grad
-        self.opt = optim.AdamW(self.evo.parameters(), lr=lr,
-                               weight_decay=weight_decay)
+        self.opt = optim.AdamW(list(self.evo.parameters()) + list(self.detail.parameters()),
+                               lr=lr, weight_decay=weight_decay)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.opt, T_max=total_steps or 100_000)
         self.global_step = 0
+        self.last_mean_loss = 0.0
+        self.last_flow_loss = 0.0
+        self.last_detail_loss = 0.0
 
     def to(self, device: torch.device) -> "RolloutTrainer":
         self.ae = self.ae.to(device)
         self.evo = self.evo.to(device)
+        self.detail = self.detail.to(device)
         self.criterion = self.criterion.to(device)
         return self
 
     def wrap_ddp(self, device: torch.device):
         from dfm.distributed import wrap_ddp
         self.evo = wrap_ddp(self.evo, device, find_unused_parameters=True)
+        self.detail = wrap_ddp(self.detail, device, find_unused_parameters=True)
 
     def load_ae(self, path: str):
         from .autoencoder import remap_ae_pyramid_keys, strip_compile_prefix
@@ -110,12 +119,26 @@ class RolloutTrainer:
         D, G = identity_map(B, C, H, W, frames.device, torch.bfloat16 if amp else torch.float32)
         field_sum  = frames.new_zeros(())
         latent_sum = frames.new_zeros(())
+        mean_sum = frames.new_zeros(())
+        flow_sum = frames.new_zeros(())
         xhat = None
         for s in range(1, K + 1):
             L = self.evo(L, step_idx=s - 1)
             latent_sum = latent_sum + F.mse_loss(L, teachers[s - 1])
-            xhat, D, G = self.ae.decoder.step(L, D, G, x0m, use_detail=True)
+            # AE is pure transport now: this is the RESOLVED (advective) frame.
+            xhat, D, G = self.ae.decoder.step(L, D, G, x0m, use_detail=False)
             field_sum = field_sum + self.criterion(xhat, frames[:, s])
+            # Closure, conditioned on the rolled-out resolved frame + evo state.
+            # detach: the detail heads must not reshape transport or evo (same
+            # boosting-style identifiability the old stage A/B split gave us).
+            ml, fl, _ = self.detail.losses(xhat.detach(), L.detach(),
+                                           frames[:, s], pixel_mask)
+            mean_sum = mean_sum + ml
+            flow_sum = flow_sum + fl
+        self.last_mean_loss = float(mean_sum.detach() / K)
+        self.last_flow_loss = float(flow_sum.detach() / K)
+        self.last_detail_loss = (cfg.detail_mean_weight * mean_sum
+                                 + cfg.detail_flow_weight * flow_sum) / K
         return field_sum / K, latent_sum / K, xhat
 
     # ---- training / validation ------------------------------------------------
@@ -126,12 +149,13 @@ class RolloutTrainer:
         (capped by the window).  Returns (field_loss, latent_loss)."""
         cfg = self.cfg
         self.evo.train()
+        self.detail.train()
         K = min(frames.shape[1] - 1,
                 random.randint(cfg.horizon_min, cfg.horizon_max))
         self.last_K = K            # so reference_losses() can match this step's horizon
         self.opt.zero_grad()
         field, latent, _ = self._rollout(frames, pixel_mask, K, training=True)
-        loss = field + self.latent_loss_weight * latent
+        loss = field + self.latent_loss_weight * latent + self.last_detail_loss
         (bad,) = allreduce_stats(0.0 if torch.isfinite(loss) else 1.0)
         if bad > 0.0:
             self.opt.zero_grad()
@@ -192,6 +216,7 @@ class RolloutTrainer:
                  ) -> Tuple[float, float, float]:
         """(field, teacher_forced, persistence) averaged over the loader."""
         self.evo.eval()
+        self.detail.eval()
         device = next(self.evo.parameters()).device
         total, tf_total, pers_total, count = 0.0, 0.0, 0.0, 0
         for _, pred_b in dataloader:
@@ -229,7 +254,9 @@ class RolloutTrainer:
         # that will not load into a bare EvolutionOperator (infer.py, or --resume,
         # which restores BEFORE compile is applied).
         def _u(m): return getattr(m, '_orig_mod', m)
-        torch.save({'evo': _u(self.evo).state_dict(), 'opt': self.opt.state_dict(),
+        torch.save({'evo': _u(self.evo).state_dict(),
+                    'detail': _u(self.detail).state_dict(),
+                    'opt': self.opt.state_dict(),
                     'scheduler': self.scheduler.state_dict(), 'cfg': self.cfg,
                     'global_step': self.global_step}, path)
 
@@ -237,6 +264,8 @@ class RolloutTrainer:
         from .autoencoder import strip_compile_prefix
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
         self.evo.load_state_dict(strip_compile_prefix(ckpt['evo']))
+        if 'detail' in ckpt:
+            self.detail.load_state_dict(strip_compile_prefix(ckpt['detail']))
         for name, obj in [('opt', self.opt), ('scheduler', self.scheduler)]:
             if name in ckpt:
                 try:
