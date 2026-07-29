@@ -93,6 +93,7 @@ def main():
     dm = FVMDataModule(args.data, n_context=cfg.n_context_frames, horizon=cfg.horizon_max,
                        batch_size=batch_size, num_workers=num_workers,
                        cache_frames=cache_frames, random_context=True, return_index=False,
+                       return_mesh_id=True, frame_mask=cfg.frame_mask,
                        mean=ae_mean, std=ae_std)
     dm.setup()
     assert dm._dataset is not None
@@ -116,6 +117,7 @@ def main():
         vdm = FVMDataModule(args.test_data, n_context=cfg.n_context_frames, horizon=cfg.horizon_max,
                             batch_size=batch_size, num_workers=0,
                             cache_frames=cache_frames, random_context=False,
+                            return_mesh_id=True, frame_mask=cfg.frame_mask,
                             mean=dm.mean, std=dm.std)
         vdm.setup()
         v_mesh_dirs = []
@@ -129,6 +131,7 @@ def main():
         vr = build_renderer(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, cfg.img_hw)
         val_pm = load_pixel_mask(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, vr, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
         val_dl = vdm.val_dataloader()
+        val_mesh_tables = (vdm.mesh_masks, vdm.mesh_fill_index, vdm.mesh_bbox)
 
     trainer = RolloutTrainer(
         cfg, lr=train_hp['lr'], weight_decay=train_hp['weight_decay'],
@@ -136,6 +139,16 @@ def main():
         pixel_mask=pixel_mask,
         latent_loss_weight=train_hp.get('latent_loss_weight'),
     ).to(device)
+
+    trainer.set_mesh_tables(dm.mesh_masks.to(device),
+                            dm.mesh_fill_index.to(device),
+                            dm.mesh_bbox.to(device))
+    if val_dl is not None:
+        trainer.set_val_mesh_tables(vdm.mesh_masks.to(device),
+                                    vdm.mesh_fill_index.to(device),
+                                    vdm.mesh_bbox.to(device))
+    print(f'Per-sample masks: {dm.mesh_masks.shape[0]} train geometries'
+          + (f', {vdm.mesh_masks.shape[0]} val' if val_dl is not None else ''))
 
     print(f'latent_loss_weight: {trainer.latent_loss_weight}  '
           f'(model cfg {cfg.latent_loss_weight}, training section '
@@ -191,10 +204,10 @@ def main():
         if hasattr(train_dl.sampler, 'set_epoch'):
             train_dl.sampler.set_epoch(epoch)
         fsum, lsum, count = 0.0, 0.0, 0
-        for _, pred_b in train_dl:
+        for _, pred_b, mesh_b in train_dl:
             prof.data_ready()
             pred_b    = pred_b.to(device, non_blocking=True)
-            field, latent = trainer.step(pred_b, pixel_mask=pixel_mask)
+            field, latent = trainer.step(pred_b, pixel_mask=pixel_mask, mesh_ids=mesh_b)
             prof.step_done(pred_b.shape[0])
             step = trainer.global_step
             if tprof is not None and step >= args.profile:
@@ -206,7 +219,7 @@ def main():
                 # f/tf ~ 1 => at the frozen AE's floor (dynamics done);
                 # f/b  is the phase-1-style persistence ratio.
                 tf, base = trainer.reference_losses(pred_b, pixel_mask=pixel_mask,
-                                                    K=trainer.last_K)
+                                                    K=trainer.last_K, mesh_ids=mesh_b)
                 f_tf = field / tf   if tf   > 1e-9 else float('nan')
                 f_b  = field / base if base > 1e-9 else float('nan')
                 print(f'epoch {epoch:3d}  step {step:6d} | field={field:.5f} '

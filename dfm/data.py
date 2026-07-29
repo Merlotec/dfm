@@ -269,6 +269,7 @@ class FVMSequenceDataset(Dataset):
         frame_cache:    Optional[list[torch.Tensor]] = None,
         random_context: bool = True,
         pixel_mask:     Optional[torch.Tensor] = None,
+        mesh_id:        Optional[int] = None,
     ):
         files = sorted(
             [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
@@ -285,6 +286,12 @@ class FVMSequenceDataset(Dataset):
         # this run's fluid mask [1, H, W] (its collider geometry).  When set, every
         # item carries it so a batch mixing different meshes can be masked per-sample.
         self.pixel_mask     = pixel_mask
+        # Index into the datamodule's per-mesh mask / fill-index tables.  Carried as
+        # an INT, not a mask tensor: a batch mixes geometries freely (ConcatDataset +
+        # shuffle), so the consumer gathers the right mask per sample.  Training used
+        # to apply ONE mask from mesh_dirs[0] to every sample -- wrong for every other
+        # geometry, and masks differ by ~13% of the frame between meshes.
+        self.mesh_id        = mesh_id
 
     def __len__(self) -> int:
         # Need enough frames for both a prediction window and a context block.
@@ -302,6 +309,8 @@ class FVMSequenceDataset(Dataset):
             c_start = 0
         context = torch.stack([self._get_frame(c_start + i) for i in range(self.n_context)])
 
+        if self.mesh_id is not None:
+            return context, pred, self.mesh_id      # + which geometry this sample is
         if self.pixel_mask is not None:
             return context, pred, self.pixel_mask   # + [1, H, W] fluid mask for this run
         return context, pred   # [n_context, C, H, W], [pred_len, C, H, W]
@@ -320,7 +329,8 @@ class FVMSequenceDataset(Dataset):
                    mean: torch.Tensor, std: torch.Tensor,
                    first_frame: int = 0,
                    random_context: bool = True,
-                   pixel_mask: Optional[torch.Tensor] = None) -> "FVMSequenceDataset":
+                   pixel_mask: Optional[torch.Tensor] = None,
+                   mesh_id: Optional[int] = None) -> "FVMSequenceDataset":
         """Pre-render and cache all frames in memory for fast repeated access."""
         files = sorted(
             [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
@@ -336,7 +346,7 @@ class FVMSequenceDataset(Dataset):
             cache.append((raw - m) / s)
         return cls(sim_dir, renderer, n_context, pred_len, mean, std,
                    first_frame, frame_cache=cache, random_context=random_context,
-                   pixel_mask=pixel_mask)
+                   pixel_mask=pixel_mask, mesh_id=mesh_id)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +396,8 @@ class FVMDataModule:
         random_context: bool = True,
         return_index: bool = False,
         return_mask: bool = False,
+        return_mesh_id: bool = False,
+        frame_mask: bool = False,
         mean: Optional[torch.Tensor] = None,
         std:  Optional[torch.Tensor] = None,
     ):
@@ -401,6 +413,12 @@ class FVMDataModule:
         self.random_context = random_context
         self.return_index   = return_index         # yield (idx, context, pred) for latent caching
         self.return_mask    = return_mask          # each item carries its run's fluid mask
+        self.return_mesh_id = return_mesh_id       # each item carries its geometry index
+        self.frame_mask     = frame_mask           # 2-channel masks [is_valid, in_frame]
+        # filled by setup(): per-geometry tables the trainer gathers per sample
+        self.mesh_masks: Optional[torch.Tensor] = None       # [n_mesh, 1|2, H, W]
+        self.mesh_fill_index: Optional[torch.Tensor] = None  # [n_mesh, H*W]
+        self.mesh_bbox: Optional[torch.Tensor] = None        # [n_mesh, 4] hole bbox
         self._dataset: Optional[ConcatDataset] = None
         self.mean: Optional[torch.Tensor] = mean
         self.std:  Optional[torch.Tensor] = std
@@ -424,7 +442,7 @@ class FVMDataModule:
         def group(root: Path):
             r = build_renderer(root, self.resolution)
             m = load_pixel_mask(root, r, self.resolution)[0] if self.return_mask else None  # [1,H,W]
-            return (r, m, self._sim_dirs(root))
+            return (r, m, self._sim_dirs(root), root)
 
         if (self.data_dir / 'shared_mesh.pkl').exists():
             return [group(self.data_dir)]
@@ -453,7 +471,7 @@ class FVMDataModule:
             else:
                 print('Computing normalisation stats...')
                 self.mean, self.std = compute_normalisation_stats_groups(
-                    [(r, sims) for r, _m, sims in groups], first_frame=self.first_frame)
+                    [(r, sims) for r, _m, sims, _root in groups], first_frame=self.first_frame)
                 with open(stats_path, 'w') as f:
                     json.dump({'mean': self.mean.tolist(), 'std': self.std.tolist()}, f)
                 print(f'Stats saved to {stats_path}')
@@ -463,15 +481,45 @@ class FVMDataModule:
         )
         datasets = [
             builder(d, renderer, self.n_context, self.pred_len, self.mean, self.std,
-                    self.first_frame, random_context=self.random_context, pixel_mask=pmask)
-            for renderer, pmask, sim_dirs in groups for d in sim_dirs
+                    self.first_frame, random_context=self.random_context, pixel_mask=pmask,
+                    mesh_id=(gi if self.return_mesh_id else None))
+            for gi, (renderer, pmask, sim_dirs, _root) in enumerate(groups) for d in sim_dirs
         ]
         datasets = [ds for ds in datasets if len(ds) > 0]
+        if self.return_mesh_id:
+            self._build_mesh_tables(groups)
         if not datasets:
             raise RuntimeError('No usable sequences found — try reducing horizon or first_frame')
         self._dataset = ConcatDataset(datasets)
         print(f'Dataset ready: {len(self._dataset)} sequences across {len(datasets)} runs '
               f'/ {len(groups)} mesh(es)')
+
+    def _build_mesh_tables(self, groups) -> None:
+        """Precompute, ONCE, the per-geometry mask / ghost-fill index / hole bbox.
+
+        The trainer then gathers row `mesh_id` per sample, so a batch mixing
+        geometries is masked correctly.  Building the fill index is ~15 ms per mesh,
+        so it must not happen per batch -- and its old identity-keyed cache cannot
+        work with per-sample masks anyway.
+        """
+        from .warp import build_fill_index, _hole_bbox
+        H, W = self.resolution
+        masks, idxs, bboxes = [], [], []
+        for renderer, _pmask, _sims, root in groups:
+            m = load_pixel_mask(root, renderer, self.resolution,
+                                frame_mask=self.frame_mask)      # [1,1|2,H,W]
+            masks.append(m[0])
+            v = m[:, :1]
+            idxs.append(build_fill_index(v))
+            bb = _hole_bbox(v)
+            bboxes.append(torch.tensor(bb if bb is not None else (0, 0, 0, 0),
+                                       dtype=torch.long))
+        self.mesh_masks      = torch.stack(masks)                # [n_mesh, 1|2, H, W]
+        self.mesh_fill_index = torch.stack(idxs)                 # [n_mesh, H*W]
+        self.mesh_bbox       = torch.stack(bboxes)               # [n_mesh, 4]
+        print(f'Mesh tables:   {len(groups)} geometries '
+              f'(masks {tuple(self.mesh_masks.shape)}, '
+              f'fill idx {tuple(self.mesh_fill_index.shape)})')
 
     def _num_workers(self) -> int:
         # When frames are cached in RAM, __getitem__ is a cheap index+normalise,

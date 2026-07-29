@@ -79,6 +79,34 @@ class RolloutTrainer:
         self.evo = wrap_ddp(self.evo, device, find_unused_parameters=True)
         self.detail = wrap_ddp(self.detail, device, find_unused_parameters=True)
 
+    def set_val_mesh_tables(self, masks, fill_index, bbox) -> None:
+        """Validation geometries are a DIFFERENT set with their own 0-based ids, so
+        they need their own tables -- indexing val ids into the train table would
+        silently pick unrelated geometries."""
+        self.val_mesh_masks = masks
+        self.val_mesh_fill_index = fill_index
+        self.val_mesh_bbox = bbox
+
+    def set_mesh_tables(self, masks, fill_index, bbox) -> None:
+        """Per-geometry tables (see FVMDataModule.setup / AutoencoderTrainer)."""
+        self.mesh_masks = masks
+        self.mesh_fill_index = fill_index
+        self.mesh_bbox = bbox
+
+    def _mask_ctx(self, pixel_mask, mesh_ids, val: bool = False):
+        """(pixel_mask, fill_index, bbox) for this batch -- per-sample when the
+        batch mixes geometries, else the shared mask."""
+        pre = 'val_mesh_' if val else 'mesh_'
+        masks = getattr(self, pre + 'masks', None)
+        if mesh_ids is None or masks is None:
+            return pixel_mask, None, None
+        fidx, bbt = getattr(self, pre + 'fill_index'), getattr(self, pre + 'bbox')
+        ids = mesh_ids.to(masks.device).long()
+        bb = bbt[ids]
+        bbox = (int(bb[:, 0].min()), int(bb[:, 1].max()),
+                int(bb[:, 2].min()), int(bb[:, 3].max()))
+        return masks[ids], fidx[ids], bbox
+
     def load_ae(self, path: str):
         from .autoencoder import remap_ae_pyramid_keys, strip_compile_prefix
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
@@ -103,12 +131,14 @@ class RolloutTrainer:
     # ---- rollout core ---------------------------------------------------------
 
     def _rollout(self, frames: torch.Tensor, pixel_mask: Optional[torch.Tensor],
-                 K: int, training: bool):
+                 K: int, training: bool, fill_index=None, bbox=None):
         """Returns (field_loss_mean, latent_loss_mean, xhat_last)."""
         cfg = self.cfg
         B, _, C, H, W = frames.shape
         x0 = frames[:, 0]
-        x0m = masked_source(x0, pixel_mask, cfg.warp_fill_holes)
+        x0m = masked_source(x0, pixel_mask, cfg.warp_fill_holes,
+                            cfg.warp_fill_smooth_iters,
+                            fill_index=fill_index, bbox=bbox)
 
         with torch.no_grad():                       # frozen AE: teachers + seed
             L = self.ae.encode(x0, x0, pixel_mask)  # zero-motion seed
@@ -127,7 +157,8 @@ class RolloutTrainer:
             latent_sum = latent_sum + F.mse_loss(L, teachers[s - 1])
             # AE is pure transport now: this is the RESOLVED (advective) frame.
             xhat, D, G = self.ae.decoder.step(L, D, G, x0m, use_detail=False)
-            field_sum = field_sum + self.criterion(xhat, frames[:, s])
+            field_sum = field_sum + self.criterion(xhat, frames[:, s],
+                                                   pixel_mask=pixel_mask)
             # Closure, conditioned on the rolled-out resolved frame + evo state.
             # detach: the detail heads must not reshape transport or evo (same
             # boosting-style identifiability the old stage A/B split gave us).
@@ -145,17 +176,20 @@ class RolloutTrainer:
     # ---- training / validation ------------------------------------------------
 
     def step(self, frames: torch.Tensor,
-             pixel_mask: Optional[torch.Tensor] = None) -> Tuple[float, float]:
+             pixel_mask: Optional[torch.Tensor] = None,
+             mesh_ids: Optional[torch.Tensor] = None) -> Tuple[float, float]:
         """frames [B, K+1, C, H, W]; rollout length ~ U{horizon_min..horizon_max}
         (capped by the window).  Returns (field_loss, latent_loss)."""
         cfg = self.cfg
+        pixel_mask, fill_index, bbox = self._mask_ctx(pixel_mask, mesh_ids)
         self.evo.train()
         self.detail.train()
         K = min(frames.shape[1] - 1,
                 random.randint(cfg.horizon_min, cfg.horizon_max))
         self.last_K = K            # so reference_losses() can match this step's horizon
         self.opt.zero_grad()
-        field, latent, _ = self._rollout(frames, pixel_mask, K, training=True)
+        field, latent, _ = self._rollout(frames, pixel_mask, K, training=True,
+                                         fill_index=fill_index, bbox=bbox)
         loss = field + self.latent_loss_weight * latent + self.last_detail_loss
         (bad,) = allreduce_stats(0.0 if torch.isfinite(loss) else 1.0)
         if bad > 0.0:
@@ -178,7 +212,9 @@ class RolloutTrainer:
     @torch.no_grad()
     def reference_losses(self, frames: torch.Tensor,
                          pixel_mask: Optional[torch.Tensor] = None,
-                         K: Optional[int] = None) -> Tuple[float, float]:
+                         K: Optional[int] = None,
+                         mesh_ids: Optional[torch.Tensor] = None,
+                         val: bool = False) -> Tuple[float, float]:
         """The two reference points that make `field` readable — (teacher_forced, persistence).
 
         `field` alone is uninterpretable: it is bounded below by the FROZEN AE's own
@@ -195,10 +231,13 @@ class RolloutTrainer:
         Costs an extra decode rollout, so call it at logging cadence, not every step.
         """
         cfg = self.cfg
+        pixel_mask, fill_index, bbox = self._mask_ctx(pixel_mask, mesh_ids, val=val)
         B, K1, C, H, W = frames.shape
         K = min(K1 - 1, cfg.horizon if K is None else K)
         x0 = frames[:, 0]
-        x0m = masked_source(x0, pixel_mask, cfg.warp_fill_holes)
+        x0m = masked_source(x0, pixel_mask, cfg.warp_fill_holes,
+                            cfg.warp_fill_smooth_iters,
+                            fill_index=fill_index, bbox=bbox)
         teachers = [self.ae.encode(frames[:, s - 1], frames[:, s], pixel_mask)
                     for s in range(1, K + 1)]
         amp = frames.device.type in ('cuda', 'xpu')
@@ -208,8 +247,8 @@ class RolloutTrainer:
         pers_sum = frames.new_zeros(())
         for s in range(1, K + 1):
             xhat, D, G = self.ae.decoder.step(teachers[s - 1], D, G, x0m, use_detail=True)
-            tf_sum   = tf_sum + self.criterion(xhat, frames[:, s])
-            pers_sum = pers_sum + self.criterion(x0m, frames[:, s])
+            tf_sum   = tf_sum + self.criterion(xhat, frames[:, s], pixel_mask=pixel_mask)
+            pers_sum = pers_sum + self.criterion(x0m, frames[:, s], pixel_mask=pixel_mask)
         return float(tf_sum / K), float(pers_sum / K)
 
     @torch.no_grad()
@@ -220,11 +259,15 @@ class RolloutTrainer:
         self.detail.eval()
         device = next(self.evo.parameters()).device
         total, tf_total, pers_total, count = 0.0, 0.0, 0.0, 0
-        for _, pred_b in dataloader:
+        for batch in dataloader:
+            pred_b, mesh_b = batch[1], (batch[2] if len(batch) > 2 else None)
             frames = pred_b.to(device)
             K = min(frames.shape[1] - 1, self.cfg.horizon)
-            field, _, _ = self._rollout(frames, pixel_mask, K, training=False)
-            tf, pers = self.reference_losses(frames, pixel_mask, K=K)
+            pm, fi, bb = self._mask_ctx(pixel_mask, mesh_b, val=True)
+            field, _, _ = self._rollout(frames, pm, K, training=False,
+                                        fill_index=fi, bbox=bb)
+            tf, pers = self.reference_losses(frames, pixel_mask, K=K, mesh_ids=mesh_b,
+                                             val=True)
             total += float(field); tf_total += tf; pers_total += pers; count += 1
         if not count:
             return float('nan'), float('nan'), float('nan')

@@ -174,9 +174,16 @@ def fill_index_for(pixel_mask: torch.Tensor):
 
 
 def apply_fill(x: torch.Tensor, fill_index: torch.Tensor) -> torch.Tensor:
-    """Gather x through a fill index -> non-fluid pixels take their nearest fluid value."""
+    """Gather x through a fill index -> non-fluid pixels take their nearest fluid value.
+
+    fill_index is [H*W] (one shared geometry) or [B, H*W] (per-sample: a batch that
+    mixes meshes needs its own donor map per sample).
+    """
     B, C = x.shape[:2]
-    idx = fill_index.view(1, 1, -1).expand(B, C, -1)
+    if fill_index.dim() == 1:
+        idx = fill_index.view(1, 1, -1).expand(B, C, -1)
+    else:
+        idx = fill_index.view(fill_index.shape[0], 1, -1).expand(B, C, -1)
     return x.reshape(B, C, -1).gather(2, idx).reshape(x.shape)
 
 
@@ -219,7 +226,9 @@ def smooth_fill(x: torch.Tensor, hole: torch.Tensor, iters: int,
 
 
 def masked_source(x0: torch.Tensor, pixel_mask: Optional[torch.Tensor],
-                  fill_holes: bool = False, smooth_iters: int = 0) -> torch.Tensor:
+                  fill_holes: bool = False, smooth_iters: int = 0,
+                  fill_index: Optional[torch.Tensor] = None,
+                  bbox: Optional[Tuple[int, int, int, int]] = None) -> torch.Tensor:
     """The X_0 that apply_map fetches from.
 
     fill_holes=False reproduces the original behaviour exactly (zero out non-fluid);
@@ -232,9 +241,11 @@ def masked_source(x0: torch.Tensor, pixel_mask: Optional[torch.Tensor],
         return x0
     if not fill_holes:
         return x0 * pixel_mask[:, :1]
-    idx, bbox = fill_index_for(pixel_mask)
-    out = apply_fill(x0, idx)
-    if smooth_iters > 0 and bbox is not None:
+    if fill_index is None:
+        # single shared geometry: build/lookup the index from the mask itself
+        fill_index, bbox = fill_index_for(pixel_mask)
+    out = apply_fill(x0, fill_index)
+    if smooth_iters > 0:
         out = smooth_fill(out, ~pixel_mask[:, :1].bool(), smooth_iters, bbox)
     return out
 

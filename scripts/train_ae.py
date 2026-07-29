@@ -84,7 +84,8 @@ def main():
     # pred window = [X_0, X_1, ..., X_{ae_max_delta}]  → pairs sampled from it
     dm = FVMDataModule(args.data, n_context=cfg.n_context_frames, horizon=cfg.ae_max_delta,
                        batch_size=batch_size, num_workers=num_workers,
-                       cache_frames=cache_frames, random_context=True)
+                       cache_frames=cache_frames, random_context=True,
+                       return_mesh_id=True, frame_mask=cfg.frame_mask)
     dm.setup()
     assert dm._dataset is not None
     steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
@@ -109,6 +110,7 @@ def main():
         vdm = FVMDataModule(args.test_data, n_context=cfg.n_context_frames, horizon=cfg.ae_max_delta,
                             batch_size=batch_size, num_workers=0,
                             cache_frames=cache_frames, random_context=False,
+                            return_mesh_id=True, frame_mask=cfg.frame_mask,
                             mean=dm.mean, std=dm.std)
         vdm.setup()
         v_mesh_dirs = []
@@ -122,6 +124,7 @@ def main():
         vr = build_renderer(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, cfg.img_hw)
         val_pm = load_pixel_mask(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, vr, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)
         val_dl = vdm.val_dataloader()
+        val_mesh_tables = (vdm.mesh_masks, vdm.mesh_fill_index, vdm.mesh_bbox)
 
     disable_gan = args.no_gan or train_hp.get('disable_gan', False)
     actual_gan_start = 10**9 if disable_gan else GAN_START_STEP
@@ -133,6 +136,18 @@ def main():
         pixel_mask=pixel_mask,
         norm_stats=(dm.mean, dm.std),   # velocity denorm for the flow aux loss
     ).to(device)
+
+    # per-sample masks: a batch mixes geometries, so one shared mask would be
+    # wrong for every mesh but the first (see FVMDataModule._build_mesh_tables)
+    trainer.set_mesh_tables(dm.mesh_masks.to(device),
+                            dm.mesh_fill_index.to(device),
+                            dm.mesh_bbox.to(device))
+    if val_dl is not None:
+        trainer.set_val_mesh_tables(vdm.mesh_masks.to(device),
+                                    vdm.mesh_fill_index.to(device),
+                                    vdm.mesh_bbox.to(device))
+    print(f'Per-sample masks: {dm.mesh_masks.shape[0]} train geometries'
+          + (f', {vdm.mesh_masks.shape[0]} val' if val_dl is not None else ''))
 
     CKPT_DIR.mkdir(exist_ok=True)
     if args.resume == 'latest':
@@ -193,12 +208,13 @@ def main():
         if hasattr(train_dl.sampler, 'set_epoch'):
             train_dl.sampler.set_epoch(epoch)
         rsum, rcnt = 0.0, 0
-        for _, pred_b in train_dl:
+        for _, pred_b, mesh_b in train_dl:
             prof.data_ready()
             # incremental composition: consecutive-pair increments composed to the
             # map from X_0 over the WHOLE window (the one and only training mode)
             recon, disc = trainer.step(
-                pred_b.to(device, non_blocking=True), pixel_mask=pixel_mask)
+                pred_b.to(device, non_blocking=True), pixel_mask=pixel_mask,
+                mesh_ids=mesh_b)
             prof.step_done(pred_b.shape[0])
             step = trainer.global_step
             if tprof is not None and step >= args.profile:

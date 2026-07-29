@@ -260,6 +260,48 @@ class AutoencoderTrainer:
                    / max(1, self.gan_ramp_steps))
         return self.cfg.disc_adv_weight * ramp
 
+    def set_val_mesh_tables(self, masks, fill_index, bbox) -> None:
+        """Validation geometries are a DIFFERENT set with their own 0-based ids, so
+        they need their own tables -- indexing val ids into the train table would
+        silently pick unrelated geometries."""
+        self.val_mesh_masks = masks
+        self.val_mesh_fill_index = fill_index
+        self.val_mesh_bbox = bbox
+
+    def set_mesh_tables(self, masks, fill_index, bbox) -> None:
+        """Install the datamodule's per-geometry tables (see FVMDataModule.setup).
+
+        With >1 mesh a batch mixes geometries, so the mask must be gathered PER
+        SAMPLE.  Training previously applied one mask from mesh_dirs[0] to every
+        sample, which is wrong for every other geometry (masks differ by ~13% of
+        the frame between meshes) and corrupts the loss mask, the encoder's mask
+        channel, the ghost-cell fill and the hole penalty all at once.
+        """
+        self.mesh_masks = masks
+        self.mesh_fill_index = fill_index
+        self.mesh_bbox = bbox
+
+    def _mask_ctx(self, pixel_mask, mesh_ids, val: bool = False):
+        """(pixel_mask, fill_index, bbox) for this batch.
+
+        mesh_ids -> per-sample gather from the tables; otherwise the shared mask
+        (single-geometry datasets, and the legacy path).
+        """
+        pre = 'val_mesh_' if val else 'mesh_'
+        masks = getattr(self, pre + 'masks', None)
+        if mesh_ids is None or masks is None:
+            return pixel_mask, None, None
+        fidx, bbt = getattr(self, pre + 'fill_index'), getattr(self, pre + 'bbox')
+        ids = mesh_ids.to(masks.device).long()
+        pm = masks[ids]                                 # [B, 1|2, H, W]
+        fi = fidx[ids]                                  # [B, H*W]
+        bb = bbt[ids]                                   # [B, 4]
+        # one bbox for the batch: the UNION, so smooth_fill relaxes a superset of
+        # every sample's hole region (correct for all, just slightly larger)
+        bbox = (int(bb[:, 0].min()), int(bb[:, 1].max()),
+                int(bb[:, 2].min()), int(bb[:, 3].max()))
+        return pm, fi, bbox
+
     def _active_levels(self, stage_b: bool) -> Optional[int]:
         """What map_head.n_active_levels should be now (None => every level active).
 
@@ -355,7 +397,7 @@ class AutoencoderTrainer:
     # ---- core sequence pass ---------------------------------------------------
 
     def _seq_pass(self, frames: torch.Tensor, pixel_mask: Optional[torch.Tensor],
-                  training: bool):
+                  training: bool, fill_index=None, bbox=None):
         """Returns (recon_report, recon_grad, reg, aux, xhat_last, x_last).
 
         recon_report = plain criterion (comparable across configs); recon_grad =
@@ -368,7 +410,7 @@ class AutoencoderTrainer:
         B, K1, C, H, W = frames.shape
         K = K1 - 1
         x0m = masked_source(frames[:, 0], pixel_mask, cfg.warp_fill_holes,
-                            cfg.warp_fill_smooth_iters)
+                            cfg.warp_fill_smooth_iters, fill_index=fill_index, bbox=bbox)
 
         freeze = training and not stage_b and self.global_step < cfg.warp_gain_freeze_steps
         aux_w = self._flow_aux_weight() if (training and not stage_b) else 0.0
@@ -476,7 +518,8 @@ class AutoencoderTrainer:
                                            pixel_mask=pixel_mask)
                 grad_sum = grad_sum + fm
                 fm_acc = fm_acc + float(fm.detach())
-                report_sum = report_sum + self.criterion(base, frames[:, s])
+                report_sum = report_sum + self.criterion(base, frames[:, s],
+                                                         pixel_mask=pixel_mask)
                 continue
             if stage_b:
                 # deterministic DetailHead path (warp_detail_generative=False).
@@ -489,7 +532,7 @@ class AutoencoderTrainer:
                 else:
                     res = detail_head(latent[:, nt:], xhat, out_hw=(H, W))
                 xhat = xhat + res.float()
-            step_report = self.criterion(xhat, frames[:, s])
+            step_report = self.criterion(xhat, frames[:, s], pixel_mask=pixel_mask)
             report_sum = report_sum + step_report
             if gate:
                 grad_sum = grad_sum + gated_recon_loss(
@@ -513,8 +556,10 @@ class AutoencoderTrainer:
     # ---- training step --------------------------------------------------------
 
     def step(self, frames: torch.Tensor,
-             pixel_mask: Optional[torch.Tensor] = None) -> Tuple[float, float]:
+             pixel_mask: Optional[torch.Tensor] = None,
+             mesh_ids: Optional[torch.Tensor] = None) -> Tuple[float, float]:
         cfg = self.cfg
+        pixel_mask, fill_index, bbox = self._mask_ctx(pixel_mask, mesh_ids)
         self.ae.train()
         self.discriminator.train()
         adv_weight = self._adv_weight()
@@ -522,7 +567,7 @@ class AutoencoderTrainer:
         self.disc_optimizer.zero_grad()
 
         recon, recon_grad, reg, aux, xhat, x_last = self._seq_pass(
-            frames, pixel_mask, training=True)
+            frames, pixel_mask, training=True, fill_index=fill_index, bbox=bbox)
         loss = recon_grad + cfg.warp_gain_l1 * reg + self._flow_aux_weight() * aux
         xhat_m = xhat.float() * pixel_mask[:, :1] if pixel_mask is not None else xhat.float()
         x0 = frames[:, 0]
@@ -600,7 +645,7 @@ class AutoencoderTrainer:
 
     @torch.no_grad()
     def persistence_baseline(self, frames: torch.Tensor,
-                             pixel_mask=None) -> float:
+                             pixel_mask=None, mesh_ids=None) -> float:
         """Loss of the DO-NOTHING model (identity map: X̂_s = X_0) on this batch.
 
         A fresh warp model starts exactly here, and batches differ wildly in how
@@ -618,14 +663,15 @@ class AutoencoderTrainer:
         _seq_pass that just ran, so the two line up step for step.
         """
         cfg = self.cfg
+        pixel_mask, fill_index, bbox = self._mask_ctx(pixel_mask, mesh_ids)
         x0m = masked_source(frames[:, 0], pixel_mask, cfg.warp_fill_holes,
-                            cfg.warp_fill_smooth_iters)
+                            cfg.warp_fill_smooth_iters, fill_index=fill_index, bbox=bbox)
         segs = getattr(self, 'last_segments', None)
         targets = ([t0 + dl for t0, dl in segs] if segs
                    else list(range(1, frames.shape[1])))
         base = frames.new_zeros(())
         for s in targets:
-            base = base + self.criterion(x0m, frames[:, s])
+            base = base + self.criterion(x0m, frames[:, s], pixel_mask=pixel_mask)
         return float(base / max(1, len(targets)))
 
     @torch.no_grad()
@@ -633,9 +679,11 @@ class AutoencoderTrainer:
         self.ae.eval()
         device = next(self.ae.parameters()).device
         total, count = 0.0, 0
-        for _, pred_b in dataloader:
-            recon, _, _, _, _, _ = self._seq_pass(pred_b.to(device), pixel_mask,
-                                                  training=False)
+        for batch in dataloader:
+            pred_b, mesh_b = batch[1], (batch[2] if len(batch) > 2 else None)
+            pm, fi, bb = self._mask_ctx(pixel_mask, mesh_b, val=True)
+            recon, _, _, _, _, _ = self._seq_pass(pred_b.to(device), pm,
+                                                  training=False, fill_index=fi, bbox=bb)
             total += float(recon); count += 1
         return total / count if count else float('nan')
 
