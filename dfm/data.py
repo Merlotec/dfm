@@ -113,6 +113,26 @@ def pad_to_multiple(x: torch.Tensor, m: int, value: float = 0.0) -> tuple[torch.
     return x, (H, W)
 
 
+def mesh_dirs_for(data_dir) -> "list[Path]":
+    """Geometry dirs in a DETERMINISTIC (sorted) order.
+
+    The scripts scanned with bare iterdir() (filesystem order) while the datamodule
+    used sorted() -- so `mesh_dirs[0]` could differ between the two, and between the
+    cluster and a laptop, making the fallback mask nondeterministic.
+
+    NOTE: this is NOT the mesh_id ordering.  FVMDataModule._mesh_groups drops meshes
+    with no run dirs and assigns ids over what SURVIVES, so ids compact past the gaps.
+    The mask table is built from those same surviving groups (see _build_mesh_tables),
+    which is why it matches by construction -- do not build a parallel table from this
+    list and index it with mesh_id.
+    """
+    data_dir = Path(data_dir)
+    if (data_dir / 'shared_mesh.pkl').exists():
+        return [data_dir]
+    return sorted(p for p in data_dir.iterdir()
+                  if p.is_dir() and (p / 'shared_mesh.pkl').exists())
+
+
 def build_pixel_mask(renderer: MeshRenderer, resolution: tuple[int, int]) -> torch.Tensor:
     """Boolean (1, 1, H, W) mask — True for pixels inside the fluid mesh."""
     H, W = resolution
@@ -447,11 +467,10 @@ class FVMDataModule:
         if (self.data_dir / 'shared_mesh.pkl').exists():
             return [group(self.data_dir)]
         groups = []
-        for md in sorted(p for p in self.data_dir.iterdir() if p.is_dir()):
-            if (md / 'shared_mesh.pkl').exists():
-                g = group(md)
-                if g[2]:
-                    groups.append(g)
+        for md in mesh_dirs_for(self.data_dir):
+            g = group(md)
+            if g[2]:                      # skip geometries with no run dirs
+                groups.append(g)
         if not groups:
             raise RuntimeError(
                 f'No shared_mesh.pkl found in {self.data_dir} or its mesh_*/ subdirs')

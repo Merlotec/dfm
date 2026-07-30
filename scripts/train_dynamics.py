@@ -21,7 +21,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfm import DFMConfig, RolloutTrainer
-from dfm.data import FVMDataModule, build_renderer, load_pixel_mask
+from dfm.data import FVMDataModule, build_renderer, load_pixel_mask, mesh_dirs_for
 from dfm.profiling import LoopProfiler, make_profiler, finish_profiler
 from dfm.distributed import init_distributed, is_main, allreduce_stats
 
@@ -99,13 +99,8 @@ def main():
     assert dm._dataset is not None
     steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
     total_steps     = steps_per_epoch * n_epochs
-    mesh_dirs = []
-    if (args.data / 'shared_mesh.pkl').exists():
-        mesh_dirs.append(args.data)
-    else:
-        for p in args.data.iterdir():
-            if p.is_dir() and (p / 'shared_mesh.pkl').exists():
-                mesh_dirs.append(p)
+    # canonical sorted order -- bare iterdir() made this filesystem-dependent
+    mesh_dirs = mesh_dirs_for(args.data)
     if not mesh_dirs:
         raise RuntimeError(f'No shared_mesh.pkl found in {args.data} or its subdirectories')
 
@@ -120,13 +115,7 @@ def main():
                             return_mesh_id=True, frame_mask=cfg.frame_mask,
                             mean=dm.mean, std=dm.std)
         vdm.setup()
-        v_mesh_dirs = []
-        if (args.test_data / 'shared_mesh.pkl').exists():
-            v_mesh_dirs.append(args.test_data)
-        else:
-            for p in args.test_data.iterdir():
-                if p.is_dir() and (p / 'shared_mesh.pkl').exists():
-                    v_mesh_dirs.append(p)
+        v_mesh_dirs = mesh_dirs_for(args.test_data)
         
         vr = build_renderer(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, cfg.img_hw)
         val_pm = load_pixel_mask(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, vr, cfg.img_hw, frame_mask=cfg.frame_mask).to(device)

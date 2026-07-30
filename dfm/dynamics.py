@@ -152,11 +152,24 @@ class RolloutTrainer:
         mean_sum = frames.new_zeros(())
         flow_sum = frames.new_zeros(())
         xhat = None
+        # The decoder is deliberately NOT under no_grad: the AE's weights are frozen,
+        # but the field loss has to backprop THROUGH it to reach evo's latent.  So the
+        # map head's activations are retained -- and it runs sum(res_i^2) query tokens
+        # (21504 at 3 pyramid levels) at d_model on EVERY rollout step.  That product
+        # is what exhausts device memory in phase 2; recompute it in backward instead.
+        def _decode(L_, D_, G_, x0m_):
+            return self.ae.decoder.step(L_, D_, G_, x0m_, use_detail=False)
+
+        use_ckpt = training and cfg.grad_checkpoint and torch.is_grad_enabled()
         for s in range(1, K + 1):
             L = self.evo(L, step_idx=s - 1)
             latent_sum = latent_sum + F.mse_loss(L, teachers[s - 1])
             # AE is pure transport now: this is the RESOLVED (advective) frame.
-            xhat, D, G = self.ae.decoder.step(L, D, G, x0m, use_detail=False)
+            if use_ckpt:
+                from torch.utils.checkpoint import checkpoint
+                xhat, D, G = checkpoint(_decode, L, D, G, x0m, use_reentrant=False)
+            else:
+                xhat, D, G = self.ae.decoder.step(L, D, G, x0m, use_detail=False)
             field_sum = field_sum + self.criterion(xhat, frames[:, s],
                                                    pixel_mask=pixel_mask)
             # Closure, conditioned on the rolled-out resolved frame + evo state.
