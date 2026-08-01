@@ -118,6 +118,26 @@ class DFMConfig:
     # fluctuation).  Weights for the two terms in the phase-2 objective:
     detail_mean_weight: float = 1.0
     detail_flow_weight: float = 1.0
+    # Steps of phase 2 before the closure switches on.  The detail heads condition on
+    # the ROLLED-OUT resolved frame and their target is (truth - that frame), so while
+    # evo is still untrained the target is dominated by evo's error rather than by
+    # subgrid physics -- and it keeps MOVING as evo learns, so the heads would fit
+    # transients and then have to unlearn them.  Waiting is the dynamics-side analogue
+    # of the old warp_stage_a_steps (freeze the base, then fit the residual).  Both
+    # heads are zero-init on their output layers, so activation is a smooth no-op.
+    # 0 = active from step 0 (no warmup).
+    detail_start_step: int = 0
+
+    # --- context encoder (dfm/context.py, phase 2) -----------------------------
+    # The transport latent says HOW the fluid moved, not the REGIME it moved in
+    # (viscosity, Re, inflow, BCs).  A block of n_context_frames from a random
+    # offset in the same run is distilled into n_ctx_tokens summary tokens that
+    # condition evo and the closure.  Phase-2 only, so a phase-1 AE stays valid.
+    # Those frames were already loaded and discarded, so the loader cost is sunk.
+    use_context: bool = True
+    ctx_patch_px: int = 32       # coarser than the main patch grid: regime, not detail
+    n_ctx_tokens: int = 8
+    n_ctx_layers: int = 2
     # AR(1) correlation of the stochastic seed across rollout frames: rho =
     # sigmoid(detail_noise_rho_init), learnable.  White-in-time detail (rho=0)
     # flickers unphysically; 2.2 -> rho ~ 0.9 (correlation time ~10 frames).

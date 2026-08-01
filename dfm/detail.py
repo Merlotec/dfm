@@ -100,12 +100,17 @@ class MeanHead(nn.Module):
 
     def forward(self, resolved: torch.Tensor, state: torch.Tensor,
                 pixel_mask: Optional[torch.Tensor] = None,
-                out_hw: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+                out_hw: Optional[Tuple[int, int]] = None,
+                context: Optional[torch.Tensor] = None) -> torch.Tensor:
         cfg = self.cfg
         r = cfg.warp_detail_res
         H, W = out_hw if out_hw is not None else resolved.shape[-2:]
         q = self.trunk(resolved, pixel_mask)
+        # regime conditioning: subgrid statistics depend on Re/viscosity, not just
+        # on the resolved frame, so the context tokens join the KV set
         kv = self.state_proj(state)
+        if context is not None:
+            kv = torch.cat([kv, self.state_proj(context)], dim=1)
         for layer in self.layers:
             q = layer(q, kv)
         out = self.head(q).permute(0, 2, 1).reshape(-1, cfg.in_channels, r, r)
@@ -139,13 +144,16 @@ class FlowHead(nn.Module):
         nn.init.zeros_(self.head.bias)
 
     def _velocity(self, x_t: torch.Tensor, t: torch.Tensor, resolved: torch.Tensor,
-                  state: torch.Tensor, pixel_mask: Optional[torch.Tensor]) -> torch.Tensor:
+                  state: torch.Tensor, pixel_mask: Optional[torch.Tensor],
+                  context: Optional[torch.Tensor] = None) -> torch.Tensor:
         cfg = self.cfg
         r = cfg.warp_detail_res
         q = self.trunk(resolved, pixel_mask)
         q = q + self.noisy_embed(x_t).flatten(2).transpose(1, 2)
         q = q + self.time_mlp(timestep_embedding(t, cfg.d_model))[:, None, :]
         kv = self.state_proj(state)
+        if context is not None:
+            kv = torch.cat([kv, self.state_proj(context)], dim=1)
         for layer in self.layers:
             q = layer(q, kv)
         return self.head(q).permute(0, 2, 1).reshape(-1, cfg.in_channels, r, r)
@@ -161,7 +169,8 @@ class FlowHead(nn.Module):
 
     def flow_loss(self, resolved: torch.Tensor, state: torch.Tensor,
                   fluctuation: torch.Tensor,
-                  pixel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                  pixel_mask: Optional[torch.Tensor] = None,
+                  context: Optional[torch.Tensor] = None) -> torch.Tensor:
         """‖v_θ(x_t, t) - (x1 - x0)‖² with x1 = fluctuation, x0 ~ N(0,I)."""
         r = self.cfg.warp_detail_res
         B = resolved.shape[0]
@@ -170,7 +179,7 @@ class FlowHead(nn.Module):
         t = torch.rand(B, device=x1.device, dtype=x1.dtype)
         tb = t[:, None, None, None]
         x_t = (1 - tb) * x0 + tb * x1
-        v = self._velocity(x_t, t, resolved, state, pixel_mask)
+        v = self._velocity(x_t, t, resolved, state, pixel_mask, context)
         w = self._coarse_w(pixel_mask, B, x1.device, x1.dtype).float()
         se = (v.float() - (x1 - x0).float()) ** 2
         return (se * w).sum() / w.expand_as(se).sum().clamp_min(1.0)
@@ -180,7 +189,8 @@ class FlowHead(nn.Module):
                pixel_mask: Optional[torch.Tensor] = None,
                out_hw: Optional[Tuple[int, int]] = None,
                noise: Optional[torch.Tensor] = None,
-               n_steps: Optional[int] = None) -> torch.Tensor:
+               n_steps: Optional[int] = None,
+               context: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Integrate dx/dt = v_θ from t=0 (noise) to t=1 (fluctuation).
 
         `noise` is the AR-correlated seed for this frame -- pass the carried state
@@ -198,7 +208,7 @@ class FlowHead(nn.Module):
         dt = 1.0 / n_steps
         for i in range(n_steps):
             t = torch.full((B,), i * dt, device=resolved.device, dtype=resolved.dtype)
-            x = x + dt * self._velocity(x, t, resolved, state, pixel_mask)
+            x = x + dt * self._velocity(x, t, resolved, state, pixel_mask, context)
         return F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
 
 
@@ -235,7 +245,8 @@ class DetailGenerator(nn.Module):
 
     def losses(self, resolved: torch.Tensor, state: torch.Tensor,
                target: torch.Tensor, pixel_mask: Optional[torch.Tensor] = None,
-               grad_checkpoint: bool = False
+               grad_checkpoint: bool = False,
+               context: Optional[torch.Tensor] = None
                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(mean_loss, flow_loss, mean_residual) for one step.
 
@@ -253,18 +264,20 @@ class DetailGenerator(nn.Module):
         hw = r_full.shape[-2:]
         if grad_checkpoint and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint
-            r_mean = checkpoint(lambda a, b: self.mean_head(a, b, pixel_mask, out_hw=hw),
-                                resolved, state, use_reentrant=False)
+            r_mean = checkpoint(
+                lambda a, b: self.mean_head(a, b, pixel_mask, out_hw=hw, context=context),
+                resolved, state, use_reentrant=False)
             fluct = r_full - r_mean.detach()
             flow_loss = checkpoint(
-                lambda a, b, c: self.flow_head.flow_loss(a, b, c, pixel_mask),
+                lambda a, b, c: self.flow_head.flow_loss(a, b, c, pixel_mask, context),
                 resolved, state, fluct, use_reentrant=False)
             w = pixel_mask[:, :1].to(r_full.dtype) if pixel_mask is not None else None
             se = (r_mean.float() - r_full.float()) ** 2
             mean_loss = ((se * w).sum() / w.expand_as(se).sum().clamp_min(1.0)
                          if w is not None else se.mean())
             return mean_loss, flow_loss, r_mean
-        r_mean = self.mean_head(resolved, state, pixel_mask, out_hw=r_full.shape[-2:])
+        r_mean = self.mean_head(resolved, state, pixel_mask, out_hw=r_full.shape[-2:],
+                                context=context)
         w = pixel_mask[:, :1].to(r_full.dtype) if pixel_mask is not None else None
         se = (r_mean.float() - r_full.float()) ** 2
         if w is not None:
@@ -272,18 +285,20 @@ class DetailGenerator(nn.Module):
         else:
             mean_loss = se.mean()
         fluct = (r_full - r_mean.detach())
-        flow_loss = self.flow_head.flow_loss(resolved, state, fluct, pixel_mask)
+        flow_loss = self.flow_head.flow_loss(resolved, state, fluct, pixel_mask, context)
         return mean_loss, flow_loss, r_mean
 
     @torch.no_grad()
     def add(self, resolved: torch.Tensor, state: torch.Tensor,
             pixel_mask: Optional[torch.Tensor] = None,
             noise: Optional[torch.Tensor] = None,
-            stochastic: bool = True) -> torch.Tensor:
+            stochastic: bool = True,
+            context: Optional[torch.Tensor] = None) -> torch.Tensor:
         """resolved + deterministic detail [+ sampled fluctuation]."""
         hw = resolved.shape[-2:]
-        out = resolved + self.mean_head(resolved, state, pixel_mask, out_hw=hw)
+        out = resolved + self.mean_head(resolved, state, pixel_mask, out_hw=hw,
+                                        context=context)
         if stochastic:
             out = out + self.flow_head.sample(resolved, state, pixel_mask,
-                                              out_hw=hw, noise=noise)
+                                              out_hw=hw, noise=noise, context=context)
         return out

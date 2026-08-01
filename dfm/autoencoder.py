@@ -33,6 +33,29 @@ from .warp import (WarpDecoder, apply_map, compose, gated_recon_loss, hole_fetch
                    identity_map, masked_source)
 
 
+def atomic_save(obj, path: str) -> None:
+    """torch.save that can't leave a truncated file at `path`.
+
+    torch.save writes in place, so a save interrupted by a wall-clock kill, an OOM
+    or a full disk leaves a CORRUPT file under a valid-looking name that shadows the
+    last good checkpoint -- this is how ae_step214000.pt was lost (90 MB of ~340 MB,
+    "failed finding central directory", unrecoverable).  Write to a temp file beside
+    the target and os.replace() it: the final name only ever appears complete.
+    """
+    import os, tempfile
+    path = str(path)
+    d = os.path.dirname(path) or '.'
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + '.', suffix='.tmp')
+    os.close(fd)
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)                 # atomic within one filesystem
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 def strip_compile_prefix(sd: dict) -> dict:
     """Drop torch.compile's `_orig_mod.` prefix from state_dict keys.
 
@@ -691,7 +714,7 @@ class AutoencoderTrainer:
 
     def save(self, path: str):
         def _u(m): return getattr(m, '_orig_mod', m)
-        torch.save({
+        atomic_save({
             'ae':             _u(self.ae).state_dict(),
             'discriminator':  _u(self.discriminator).state_dict(),
             'gen_optimizer':  self.gen_optimizer.state_dict(),

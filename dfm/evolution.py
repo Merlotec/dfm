@@ -39,11 +39,17 @@ class _Tendency(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def forward(self, slots: torch.Tensor) -> torch.Tensor:
-        x = slots
+    def forward(self, slots: torch.Tensor,
+                context: torch.Tensor = None) -> torch.Tensor:
+        # Context tokens are APPENDED to the sequence so every self-attention layer
+        # can read them, then sliced off: the tendency keeps the slot shape, but each
+        # slot has seen the run's regime.  Cheaper and simpler than a separate
+        # cross-attention stack, and the context tokens are few (n_ctx_tokens).
+        n = slots.shape[1]
+        x = slots if context is None else torch.cat([slots, context], dim=1)
         for blk in self.blocks:
             x = blk(x)
-        return self.head(self.norm(x))
+        return self.head(self.norm(x[:, :n]))
 
 
 class EvolutionOperator(nn.Module):
@@ -56,26 +62,27 @@ class EvolutionOperator(nn.Module):
         # Learnable latent step size, initialised to dt = 1.
         self.log_dt = nn.Parameter(torch.zeros(()))
 
-    def _f(self, slots: torch.Tensor, step_idx) -> torch.Tensor:
+    def _f(self, slots: torch.Tensor, step_idx, context=None) -> torch.Tensor:
         cap = self.cfg.max_rollout - 1
         if torch.is_tensor(step_idx):
             # per-example step indices [B] → per-example embedding [B, 1, d]
             emb = self.step_emb(step_idx.clamp(max=cap)).unsqueeze(1)
         else:
             emb = self.step_emb(torch.tensor(min(step_idx, cap), device=slots.device))
-        return self.tendency(slots + emb)
+        return self.tendency(slots + emb, context)
 
-    def forward(self, slots: torch.Tensor, step_idx) -> torch.Tensor:
+    def forward(self, slots: torch.Tensor, step_idx, context=None) -> torch.Tensor:
         """Advance slots by one latent step.  slots: [B, n_slots, d_model].
-        `step_idx`: Python int or [B] tensor of per-example indices."""
+        `step_idx`: Python int or [B] tensor of per-example indices.
+        `context`: optional [B, K, d_model] regime summary (see dfm/context.py)."""
         dt = torch.exp(self.log_dt)
 
         if self.cfg.integrator == 'euler':
-            return slots + dt * self._f(slots, step_idx)
+            return slots + dt * self._f(slots, step_idx, context)
 
         if self.cfg.integrator == 'rk2':          # midpoint
-            k1 = self._f(slots, step_idx)
-            k2 = self._f(slots + 0.5 * dt * k1, step_idx)
+            k1 = self._f(slots, step_idx, context)
+            k2 = self._f(slots + 0.5 * dt * k1, step_idx, context)
             return slots + dt * k2
 
         raise ValueError(f'Unknown integrator: {self.cfg.integrator}')

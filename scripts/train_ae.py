@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dfm import DFMConfig, AutoencoderTrainer
 from dfm.data import FVMDataModule, build_renderer, load_pixel_mask, mesh_dirs_for
 from dfm.profiling import LoopProfiler, make_profiler, finish_profiler
-from dfm.distributed import init_distributed, is_main, allreduce_stats
+from dfm.distributed import (init_distributed, is_main, allreduce_stats,
+                             barrier, sync_dataset_length)
 
 _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'
@@ -86,8 +87,17 @@ def main():
                        batch_size=batch_size, num_workers=num_workers,
                        cache_frames=cache_frames, random_context=True,
                        return_mesh_id=True, frame_mask=cfg.frame_mask)
-    dm.setup()
+    # Rank 0 populates the renderer / pixel-mask / stats caches first; the others
+    # wait and then just READ them.  Without this all 8 ranks compute the stats and
+    # write hfm_input_stats.json + every mesh's pixel_mask_*.pt concurrently.
+    if is_main():
+        dm.setup()
+    barrier()
+    if not is_main():
+        dm.setup()
     assert dm._dataset is not None
+    # and make every rank agree on the length (see sync_dataset_length)
+    dm._dataset = sync_dataset_length(dm._dataset, 'train')
     steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
     total_steps     = steps_per_epoch * n_epochs
     # canonical sorted order -- bare iterdir() made this filesystem-dependent
@@ -107,7 +117,13 @@ def main():
                             cache_frames=cache_frames, random_context=False,
                             return_mesh_id=True, frame_mask=cfg.frame_mask,
                             mean=dm.mean, std=dm.std)
-        vdm.setup()
+        if is_main():
+            vdm.setup()
+        barrier()
+        if not is_main():
+            vdm.setup()
+        assert vdm._dataset is not None
+        vdm._dataset = sync_dataset_length(vdm._dataset, 'val')
         v_mesh_dirs = mesh_dirs_for(args.test_data)
         
         vr = build_renderer(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, cfg.img_hw)
@@ -229,10 +245,14 @@ def main():
 
             ckpt_after = train_hp.get('checkpoint_after', 0)
             if ckpt_after > 0 and step > 0 and step % ckpt_after == 0:
+                # Only rank 0 writes, so the others must WAIT here -- otherwise they
+                # race ahead into the next step's collective and burn the timeout
+                # while rank 0 is still writing a few hundred MB.
                 if is_main():
                     path = CKPT_DIR / f'ae_step{step:06d}.pt'
                     trainer.save(str(path))
                     print(f'  [ckpt] {path.name}')
+                barrier()
 
         train_r = rsum / rcnt if rcnt else float('nan')
         val_r = trainer.validate(val_dl, pixel_mask=val_pm) if val_dl else float('nan')
@@ -246,6 +266,7 @@ def main():
             if (epoch + 1) % 2 == 0:
                 path = CKPT_DIR / f'ae_epoch{epoch:03d}.pt'
                 trainer.save(str(path)); print(f'  [ckpt] {path.name}')
+        barrier()
     
     if is_main() and log is not None:
         log.close()

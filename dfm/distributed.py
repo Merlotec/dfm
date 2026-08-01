@@ -132,13 +132,15 @@ def init_distributed():
             torch.cuda.set_device(device)
         elif device.type == 'xpu':
             torch.xpu.set_device(device)
-        # Short collective timeout: when one rank dies (OOM-kill, crash), the
-        # others block at the next collective — with gloo's default that is a
-        # silent 30-MINUTE hang before anyone reports anything.  5 minutes is
-        # generous for any real collective here and surfaces failures fast.
+        # Collective timeout: when one rank dies (OOM-kill, crash) the others block
+        # at the next collective, so a SHORT timeout surfaces failures fast.  But it
+        # must exceed the longest legitimate gap between collectives -- notably the
+        # rank-0 checkpoint write (hundreds of MB to a contended parallel FS).  The
+        # old hard-coded 300s was under that on Dawn.  Override with DFM_DDP_TIMEOUT.
         import datetime
+        timeout_s = int(os.environ.get('DFM_DDP_TIMEOUT', '1800'))
         torch.distributed.init_process_group(
-            timeout=datetime.timedelta(seconds=300),
+            timeout=datetime.timedelta(seconds=timeout_s),
             backend=_ddp_backend(device), rank=rank, world_size=world)
     return rank, world, local, device
 
@@ -215,6 +217,42 @@ def allreduce_stats(*vals: float):
     t = torch.tensor(vals, dtype=torch.float64)
     torch.distributed.all_reduce(t)
     return t.tolist()
+
+
+def allreduce_min(v: float) -> float:
+    """Global MIN of a scalar (host-side).  Returns v unchanged when not distributed."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return v
+    t = torch.tensor([float(v)], dtype=torch.float64)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
+    return float(t.item())
+
+
+def sync_dataset_length(dataset, name: str = 'dataset'):
+    """Force every rank to use the SAME number of samples.
+
+    DistributedSampler derives its per-rank sample count from len(dataset), so if
+    ranks disagree they get different BATCH counts: the short ranks leave the epoch
+    early and go into validation while the others are still stepping, and those
+    others then block at the next collective until the timeout fires.  That is a
+    silent 300s hang whose traceback points at an innocent all_reduce.
+
+    Ranks can disagree whenever the data dir is scanned at slightly different times
+    -- a generation job still writing frames, or just parallel-FS metadata lag.
+    Truncating everyone to the global minimum costs a handful of windows and makes
+    the schedule identical.
+    """
+    n = len(dataset)
+    n_min = int(allreduce_min(n))
+    if n_min != n:
+        from torch.utils.data import Subset
+        if is_main():
+            print(f'  [sync] {name}: ranks disagree on length (this rank {n}, '
+                  f'global min {n_min}) -- truncating to {n_min} so every rank gets '
+                  f'the same batch count.  Check whether the data dir is still being '
+                  f'written.')
+        return Subset(dataset, range(n_min))
+    return dataset
 
 
 def is_main() -> bool:

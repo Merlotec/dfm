@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dfm import DFMConfig, RolloutTrainer
 from dfm.data import FVMDataModule, build_renderer, load_pixel_mask, mesh_dirs_for
 from dfm.profiling import LoopProfiler, make_profiler, finish_profiler
-from dfm.distributed import init_distributed, is_main, allreduce_stats
+from dfm.distributed import (init_distributed, is_main, allreduce_stats,
+                             barrier, sync_dataset_length)
 
 _ROOT      = Path(__file__).resolve().parents[1]
 _DATA_ROOT = _ROOT.parent / 'data'
@@ -95,8 +96,17 @@ def main():
                        cache_frames=cache_frames, random_context=True, return_index=False,
                        return_mesh_id=True, frame_mask=cfg.frame_mask,
                        mean=ae_mean, std=ae_std)
-    dm.setup()
+    # Rank 0 populates the renderer / pixel-mask / stats caches first; the others
+    # wait and then just READ them.  Without this all 8 ranks compute the stats and
+    # write hfm_input_stats.json + every mesh's pixel_mask_*.pt concurrently.
+    if is_main():
+        dm.setup()
+    barrier()
+    if not is_main():
+        dm.setup()
     assert dm._dataset is not None
+    # and make every rank agree on the length (see sync_dataset_length)
+    dm._dataset = sync_dataset_length(dm._dataset, 'train')
     steps_per_epoch = math.ceil(len(dm._dataset) / batch_size)
     total_steps     = steps_per_epoch * n_epochs
     # canonical sorted order -- bare iterdir() made this filesystem-dependent
@@ -114,7 +124,13 @@ def main():
                             cache_frames=cache_frames, random_context=False,
                             return_mesh_id=True, frame_mask=cfg.frame_mask,
                             mean=dm.mean, std=dm.std)
-        vdm.setup()
+        if is_main():
+            vdm.setup()
+        barrier()
+        if not is_main():
+            vdm.setup()
+        assert vdm._dataset is not None
+        vdm._dataset = sync_dataset_length(vdm._dataset, 'val')
         v_mesh_dirs = mesh_dirs_for(args.test_data)
         
         vr = build_renderer(v_mesh_dirs[0] if v_mesh_dirs else args.test_data, cfg.img_hw)
@@ -139,6 +155,18 @@ def main():
     print(f'Per-sample masks: {dm.mesh_masks.shape[0]} train geometries'
           + (f', {vdm.mesh_masks.shape[0]} val' if val_dl is not None else ''))
 
+    if cfg.use_context:
+        _ce = trainer.context_encoder
+        print(f'Context encoder:    ON  ({cfg.n_context_frames} frames @ '
+              f'{cfg.ctx_patch_px}px -> {cfg.n_ctx_tokens} tokens, '
+              f'{sum(p.numel() for p in _ce.parameters())/1e6:.1f}M params)')
+    else:
+        print('Context encoder:    OFF (use_context=False)')
+    print(f'Closure:            mean+flow heads '
+          + ('ACTIVE from step 0' if cfg.detail_start_step <= 0
+             else f'activate at step {cfg.detail_start_step} '
+                  f'(evo warmup first; currently '
+                  f'{"ON" if trainer.global_step >= cfg.detail_start_step else "OFF"})'))
     print(f'latent_loss_weight: {trainer.latent_loss_weight}  '
           f'(model cfg {cfg.latent_loss_weight}, training section '
           f'{train_hp.get("latent_loss_weight")})')
@@ -193,10 +221,12 @@ def main():
         if hasattr(train_dl.sampler, 'set_epoch'):
             train_dl.sampler.set_epoch(epoch)
         fsum, lsum, count = 0.0, 0.0, 0
-        for _, pred_b, mesh_b in train_dl:
+        for ctx_b, pred_b, mesh_b in train_dl:
             prof.data_ready()
             pred_b    = pred_b.to(device, non_blocking=True)
-            field, latent = trainer.step(pred_b, pixel_mask=pixel_mask, mesh_ids=mesh_b)
+            ctx_b     = ctx_b.to(device, non_blocking=True) if cfg.use_context else None
+            field, latent = trainer.step(pred_b, pixel_mask=pixel_mask, mesh_ids=mesh_b,
+                                         ctx=ctx_b)
             prof.step_done(pred_b.shape[0])
             step = trainer.global_step
             if tprof is not None and step >= args.profile:
@@ -213,16 +243,20 @@ def main():
                 f_b  = field / base if base > 1e-9 else float('nan')
                 print(f'epoch {epoch:3d}  step {step:6d} | field={field:.5f} '
                       f'tf={tf:.5f} base={base:.5f} f/tf={f_tf:.2f} f/b={f_b:.2f} '
-                      f'latent={latent:.5f} mean={trainer.last_mean_loss:.5f} '
-                      f'flow={trainer.last_flow_loss:.5f} rho={float(trainer.detail.rho):.3f}'
-                      f'  |  {prof.line()}')
+                      f'latent={latent:.5f} '
+                      + (f'mean={trainer.last_mean_loss:.5f} flow={trainer.last_flow_loss:.5f} '
+                         f'rho={float(trainer.detail.rho):.3f}'
+                         if trainer.last_detail_on else 'closure=OFF')
+                      + f'  |  {prof.line()}')
 
             ckpt_after = train_hp.get('checkpoint_after', 0)
             if ckpt_after > 0 and step > 0 and step % ckpt_after == 0:
+                # see train_ae.py: rank 0 writes, everyone else waits here
                 if is_main():
                     path = CKPT_DIR / f'dyn_step{step:06d}.pt'
                     trainer.save(str(path))
                     print(f'  [ckpt] {path.name}')
+                barrier()
 
         train_f = fsum / count if count else float('nan')
         train_l = lsum / count if count else float('nan')
@@ -249,6 +283,7 @@ def main():
             if (epoch + 1) % 2 == 0:
                 path = CKPT_DIR / f'dyn_epoch{epoch:03d}.pt'
                 trainer.save(str(path)); print(f'  [ckpt] {path.name}')
+        barrier()
     
     if is_main() and log is not None:
         log.close()
