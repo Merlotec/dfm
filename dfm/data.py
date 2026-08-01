@@ -206,16 +206,27 @@ def compute_normalisation_stats(
     s1 = torch.zeros(C)
     s2 = torch.zeros(C)
     cnt = torch.zeros(C)
+    n_bad = 0
     for i in idx:
-        d = np.load(all_files[i])
-        vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
-        frame = renderer.render_cell_smooth(vals)   # [C, H, W]
+        # Skip truncated/zero-byte frames rather than aborting the whole run at setup:
+        # these are statistics over a random sample, so a few dropped frames are
+        # statistically irrelevant.
+        try:
+            d = np.load(all_files[i])
+            vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
+            frame = renderer.render_cell_smooth(vals)   # [C, H, W]
+        except Exception:
+            n_bad += 1
+            continue
         for c in range(C):
             px = frame[c]
             fin = px[torch.isfinite(px)]
             s1[c]  += fin.sum()
             s2[c]  += (fin ** 2).sum()
             cnt[c] += fin.numel()
+    if n_bad:
+        print(f'  [warn] stats: skipped {n_bad}/{n} unreadable frame(s) '
+              '(run scripts/check_frames.py to find them)')
 
     mean = s1 / cnt
     std  = ((s2 / cnt) - mean ** 2).clamp(min=0).sqrt().clamp(min=1e-6)
@@ -243,9 +254,13 @@ def compute_normalisation_stats_groups(
             continue
         n = min(per_group, len(files))
         for i in torch.randperm(len(files))[:n].tolist():
-            d = np.load(files[i])
-            vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
-            frame = renderer.render_cell_smooth(vals)
+            # Skip unreadable frames — see compute_normalisation_stats above.
+            try:
+                d = np.load(files[i])
+                vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
+                frame = renderer.render_cell_smooth(vals)
+            except Exception:
+                continue
             for c in range(C):
                 fin = frame[c][torch.isfinite(frame[c])]
                 s1[c]  += fin.sum();  s2[c] += (fin ** 2).sum();  cnt[c] += fin.numel()
@@ -319,21 +334,47 @@ class FVMSequenceDataset(Dataset):
             return 0
         return max(0, len(self.paths) - self.pred_len + 1)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        pred = torch.stack([self._get_frame(idx + i) for i in range(self.pred_len)])
+    # Warn at most once per worker process about unreadable frames, so a handful of
+    # bad files don't flood the log.
+    _warned_corrupt = False
 
-        n = len(self.paths)
-        if self.random_context:
-            c_start = int(torch.randint(0, n - self.n_context + 1, (1,)).item())
-        else:
-            c_start = 0
-        context = torch.stack([self._get_frame(c_start + i) for i in range(self.n_context)])
+    def __getitem__(self, idx: int) -> tuple:
+        # A truncated / zero-byte .npz (left behind by a simulation that crashed
+        # mid-write) makes np.load raise EOFError.  Letting that propagate kills the
+        # DataLoader worker, which kills the rank, which strands every OTHER rank in
+        # its next collective ("Connection closed by peer") — i.e. one bad file takes
+        # down the whole job hours in.  Skip to a different window instead, and return
+        # a wholly valid sample rather than splicing around the bad frame.
+        n_samples = max(1, len(self))
+        for _ in range(4):
+            try:
+                pred = torch.stack(
+                    [self._get_frame(idx + i) for i in range(self.pred_len)])
 
-        if self.mesh_id is not None:
-            return context, pred, self.mesh_id      # + which geometry this sample is
-        if self.pixel_mask is not None:
-            return context, pred, self.pixel_mask   # + [1, H, W] fluid mask for this run
-        return context, pred   # [n_context, C, H, W], [pred_len, C, H, W]
+                n = len(self.paths)
+                if self.random_context:
+                    c_start = int(torch.randint(0, n - self.n_context + 1, (1,)).item())
+                else:
+                    c_start = 0
+                context = torch.stack(
+                    [self._get_frame(c_start + i) for i in range(self.n_context)])
+
+                if self.mesh_id is not None:
+                    return context, pred, self.mesh_id    # + which geometry this is
+                if self.pixel_mask is not None:
+                    return context, pred, self.pixel_mask  # + [1, H, W] fluid mask
+                return context, pred   # [n_context, C, H, W], [pred_len, C, H, W]
+            except Exception as e:                        # unreadable/corrupt frame
+                if not FVMSequenceDataset._warned_corrupt:
+                    bad = self.paths[min(idx, len(self.paths) - 1)]
+                    print(f'  [warn] unreadable frame near {bad}: {type(e).__name__}: {e}')
+                    print('         Skipping this sample.  Find bad files with:')
+                    print('         python scripts/check_frames.py <data_dir>')
+                    FVMSequenceDataset._warned_corrupt = True
+                idx = (idx + self.pred_len) % n_samples
+        raise RuntimeError(
+            f'{self.paths[0].parent}: could not read a valid sequence after 4 attempts '
+            '— this run is likely truncated; remove or repair it.')
 
     def _get_frame(self, i: int) -> torch.Tensor:
         if self._cache is not None:
