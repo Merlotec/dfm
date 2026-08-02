@@ -69,6 +69,8 @@ class RolloutTrainer:
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.opt, T_max=total_steps or 100_000)
         self.global_step = 0
+        self.last_field_detail = float('nan')
+        self.last_field_sampled = float('nan')
         self.last_mean_loss = 0.0
         self.last_flow_loss = 0.0
         self.last_detail_loss = 0.0
@@ -143,7 +145,8 @@ class RolloutTrainer:
     # ---- rollout core ---------------------------------------------------------
 
     def _rollout(self, frames: torch.Tensor, pixel_mask: Optional[torch.Tensor],
-                 K: int, training: bool, fill_index=None, bbox=None, ctx=None):
+                 K: int, training: bool, fill_index=None, bbox=None, ctx=None,
+                 measure_detail: bool = False):
         """Returns (field_loss_mean, latent_loss_mean, xhat_last)."""
         cfg = self.cfg
         B, _, C, H, W = frames.shape
@@ -167,6 +170,15 @@ class RolloutTrainer:
         latent_sum = frames.new_zeros(())
         mean_sum = frames.new_zeros(())
         flow_sum = frames.new_zeros(())
+        # Diagnostic only (no grad): `field` is scored on the TRANSPORT-ONLY frame and
+        # the detail heads take a detached input, so no amount of closure improvement
+        # can ever move field / f_tf / f_b.  These two measure the frame the model
+        # would actually emit.  fd uses the deterministic mean head -- the MMSE
+        # estimate, so it is the fair like-for-like against field and tf.  fds adds a
+        # sampled fluctuation and SHOULD score worse pointwise (a valid sample is not
+        # the conditional mean); judge that one on spectra, not on this number.
+        fd_sum  = 0.0
+        fds_sum = 0.0
         xhat = None
         # The decoder is deliberately NOT under no_grad: the AE's weights are frozen,
         # but the field loss has to backprop THROUGH it to reach evo's latent.  So the
@@ -203,6 +215,30 @@ class RolloutTrainer:
                                                context=context)
                 mean_sum = mean_sum + ml
                 flow_sum = flow_sum + fl
+                if measure_detail:
+                    with torch.no_grad():
+                        det = self.detail.add(xhat.detach(), L.detach(), pixel_mask,
+                                              stochastic=False, context=context)
+                        fd_sum += float(self.criterion(det, frames[:, s],
+                                                       pixel_mask=pixel_mask))
+                        # Draw the sampler's noise from a DEDICATED generator: a bare
+                        # torch.randn here would consume the global RNG stream and shift
+                        # the flow-matching noise of every later rollout step, so a
+                        # logging step would train differently from a non-logging one
+                        # (measured: max|grad diff| 1.1e-01).  Diagnostics must not
+                        # perturb training.
+                        dg = getattr(self, '_diag_gen', None)
+                        if dg is None:
+                            dg = self._diag_gen = torch.Generator().manual_seed(1234)
+                        r = cfg.warp_detail_res
+                        z = torch.randn(xhat.shape[0], cfg.in_channels, r, r,
+                                        generator=dg).to(xhat.device, xhat.dtype)
+                        smp = self.detail.add(xhat.detach(), L.detach(), pixel_mask,
+                                              stochastic=True, noise=z, context=context)
+                        fds_sum += float(self.criterion(smp, frames[:, s],
+                                                        pixel_mask=pixel_mask))
+        self.last_field_detail = (fd_sum / K) if measure_detail and detail_on else float('nan')
+        self.last_field_sampled = (fds_sum / K) if measure_detail and detail_on else float('nan')
         self.last_mean_loss = float(mean_sum.detach() / K)
         self.last_flow_loss = float(flow_sum.detach() / K)
         self.last_detail_loss = (cfg.detail_mean_weight * mean_sum
@@ -214,7 +250,8 @@ class RolloutTrainer:
     def step(self, frames: torch.Tensor,
              pixel_mask: Optional[torch.Tensor] = None,
              mesh_ids: Optional[torch.Tensor] = None,
-             ctx: Optional[torch.Tensor] = None) -> Tuple[float, float]:
+             ctx: Optional[torch.Tensor] = None,
+             measure_detail: bool = False) -> Tuple[float, float]:
         """frames [B, K+1, C, H, W]; rollout length ~ U{horizon_min..horizon_max}
         (capped by the window).  Returns (field_loss, latent_loss)."""
         cfg = self.cfg
@@ -228,7 +265,8 @@ class RolloutTrainer:
         self.last_K = K            # so reference_losses() can match this step's horizon
         self.opt.zero_grad()
         field, latent, _ = self._rollout(frames, pixel_mask, K, training=True,
-                                         fill_index=fill_index, bbox=bbox, ctx=ctx)
+                                         fill_index=fill_index, bbox=bbox, ctx=ctx,
+                                         measure_detail=measure_detail)
         loss = field + self.latent_loss_weight * latent + self.last_detail_loss
         (bad,) = allreduce_stats(0.0 if torch.isfinite(loss) else 1.0)
         if bad > 0.0:
@@ -292,14 +330,14 @@ class RolloutTrainer:
 
     @torch.no_grad()
     def validate(self, dataloader, pixel_mask: Optional[torch.Tensor] = None
-                 ) -> Tuple[float, float, float]:
-        """(field, teacher_forced, persistence) averaged over the loader."""
+                 ) -> Tuple[float, float, float, float]:
+        """(field, teacher_forced, persistence, field_with_detail) over the loader."""
         self.evo.eval()
         self.detail.eval()
         if self.context_encoder is not None:
             self.context_encoder.eval()
         device = next(self.evo.parameters()).device
-        total, tf_total, pers_total, count = 0.0, 0.0, 0.0, 0
+        total, tf_total, pers_total, fd_total, count = 0.0, 0.0, 0.0, 0.0, 0
         for batch in dataloader:
             ctx_b  = batch[0] if self.context_encoder is not None else None
             pred_b, mesh_b = batch[1], (batch[2] if len(batch) > 2 else None)
@@ -309,13 +347,16 @@ class RolloutTrainer:
             K = min(frames.shape[1] - 1, self.cfg.horizon)
             pm, fi, bb = self._mask_ctx(pixel_mask, mesh_b, val=True)
             field, _, _ = self._rollout(frames, pm, K, training=False,
-                                        fill_index=fi, bbox=bb, ctx=ctx_b)
+                                        fill_index=fi, bbox=bb, ctx=ctx_b,
+                                        measure_detail=True)
+            fd = self.last_field_detail
+            fd_total += fd if fd == fd else float(field)      # NaN -> closure is off
             tf, pers = self.reference_losses(frames, pixel_mask, K=K, mesh_ids=mesh_b,
                                              val=True)
             total += float(field); tf_total += tf; pers_total += pers; count += 1
         if not count:
-            return float('nan'), float('nan'), float('nan')
-        return total / count, tf_total / count, pers_total / count
+            return (float('nan'),) * 4
+        return (total / count, tf_total / count, pers_total / count, fd_total / count)
 
     @torch.no_grad()
     def rollout(self, x0: torch.Tensor, n_steps: int,

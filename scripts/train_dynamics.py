@@ -162,11 +162,6 @@ def main():
               f'{sum(p.numel() for p in _ce.parameters())/1e6:.1f}M params)')
     else:
         print('Context encoder:    OFF (use_context=False)')
-    print(f'Closure:            mean+flow heads '
-          + ('ACTIVE from step 0' if cfg.detail_start_step <= 0
-             else f'activate at step {cfg.detail_start_step} '
-                  f'(evo warmup first; currently '
-                  f'{"ON" if trainer.global_step >= cfg.detail_start_step else "OFF"})'))
     print(f'latent_loss_weight: {trainer.latent_loss_weight}  '
           f'(model cfg {cfg.latent_loss_weight}, training section '
           f'{train_hp.get("latent_loss_weight")})')
@@ -180,6 +175,14 @@ def main():
     if args.resume:
         if is_main(): print(f'Resuming from {args.resume}')
         trainer.load(str(args.resume))
+
+    # AFTER resume: global_step is only meaningful once the checkpoint is loaded,
+    # otherwise a resumed run reports the step-0 state (it said OFF at step 6000).
+    print(f'Closure:            mean+flow heads '
+          + ('ACTIVE from step 0' if cfg.detail_start_step <= 0
+             else f'activate at step {cfg.detail_start_step} -- at step '
+                  f'{trainer.global_step} they are '
+                  f'{"ON" if trainer.global_step >= cfg.detail_start_step else "OFF"}'))
 
     trainer.wrap_ddp(device)
 
@@ -209,7 +212,7 @@ def main():
         w = csv.writer(log)
         if (CKPT_DIR / 'dyn_loss_log.csv').stat().st_size == 0:
             w.writerow(['epoch', 'train_field_loss', 'train_latent_loss', 'val_field_loss',
-                        'val_teacher_forced', 'val_persistence']); log.flush()
+                        'val_teacher_forced', 'val_persistence', 'val_field_detail']); log.flush()
 
     prof  = LoopProfiler(device)
     tprof = make_profiler(args.profile > 0, device)
@@ -225,8 +228,9 @@ def main():
             prof.data_ready()
             pred_b    = pred_b.to(device, non_blocking=True)
             ctx_b     = ctx_b.to(device, non_blocking=True) if cfg.use_context else None
+            will_log = (trainer.global_step + 1) % args.log_every == 0
             field, latent = trainer.step(pred_b, pixel_mask=pixel_mask, mesh_ids=mesh_b,
-                                         ctx=ctx_b)
+                                         ctx=ctx_b, measure_detail=will_log)
             prof.step_done(pred_b.shape[0])
             step = trainer.global_step
             if tprof is not None and step >= args.profile:
@@ -244,7 +248,10 @@ def main():
                 print(f'epoch {epoch:3d}  step {step:6d} | field={field:.5f} '
                       f'tf={tf:.5f} base={base:.5f} f/tf={f_tf:.2f} f/b={f_b:.2f} '
                       f'latent={latent:.5f} '
-                      + (f'mean={trainer.last_mean_loss:.5f} flow={trainer.last_flow_loss:.5f} '
+                      + (f'fd={trainer.last_field_detail:.5f} '
+                         f'fd/tf={trainer.last_field_detail/tf if tf > 1e-9 else float("nan"):.2f} '
+                         f'fds={trainer.last_field_sampled:.5f} '
+                         f'mean={trainer.last_mean_loss:.5f} flow={trainer.last_flow_loss:.5f} '
                          f'rho={float(trainer.detail.rho):.3f}'
                          if trainer.last_detail_on else 'closure=OFF')
                       + f'  |  {prof.line()}')
@@ -260,16 +267,17 @@ def main():
 
         train_f = fsum / count if count else float('nan')
         train_l = lsum / count if count else float('nan')
-        val_f, val_tf, val_base = (trainer.validate(val_dl, pixel_mask=val_pm)
-                                   if val_dl else (float('nan'),) * 3)
+        val_f, val_tf, val_base, val_fd = (trainer.validate(val_dl, pixel_mask=val_pm)
+                                           if val_dl else (float('nan'),) * 4)
 
-        train_f, train_l, val_f, val_tf, val_base = allreduce_stats(
-            train_f, train_l, val_f, val_tf, val_base)
+        train_f, train_l, val_f, val_tf, val_base, val_fd = allreduce_stats(
+            train_f, train_l, val_f, val_tf, val_base, val_fd)
         train_f /= world
         train_l /= world
         val_f /= world
         val_tf /= world
         val_base /= world
+        val_fd /= world
 
         if is_main():
             vf_tf = val_f / val_tf   if val_tf   > 1e-9 else float('nan')
@@ -277,9 +285,10 @@ def main():
             print(f'  [epoch {epoch:3d}] train_field={train_f:.5f} '
                   f'train_latent={train_l:.5f}  val_field={val_f:.5f} '
                   f'val_tf={val_tf:.5f} val_base={val_base:.5f} '
-                  f'val_f/tf={vf_tf:.2f} val_f/b={vf_b:.2f}')
+                  f'val_f/tf={vf_tf:.2f} val_f/b={vf_b:.2f} '
+                  f'val_fd={val_fd:.5f} val_fd/tf={val_fd/val_tf if val_tf > 1e-9 else float("nan"):.2f}')
             w.writerow([epoch, f'{train_f:.6f}', f'{train_l:.6f}', f'{val_f:.6f}',
-                        f'{val_tf:.6f}', f'{val_base:.6f}']); log.flush()
+                        f'{val_tf:.6f}', f'{val_base:.6f}', f'{val_fd:.6f}']); log.flush()
             if (epoch + 1) % 2 == 0:
                 path = CKPT_DIR / f'dyn_epoch{epoch:03d}.pt'
                 trainer.save(str(path)); print(f'  [ckpt] {path.name}')
