@@ -29,8 +29,8 @@ from .modules import (PatchEmbed, LocalSelfAttnBlock, CrossAttnBlock, SelfAttnBl
                       sincos_2d, add_relative_noise)
 from .discriminator import DFMDiscriminator
 from .losses import FluidLoss
-from .warp import (WarpDecoder, apply_map, compose, gated_recon_loss, hole_fetch_penalty,
-                   identity_map, masked_source)
+from .warp import (DetailRefiner, WarpDecoder, apply_map, compose, gated_recon_loss,
+                   hole_fetch_penalty, identity_map, masked_source)
 
 
 def atomic_save(obj, path: str) -> None:
@@ -548,10 +548,19 @@ class AutoencoderTrainer:
                 # deterministic DetailHead path (warp_detail_generative=False).
                 # gradient-checkpoint it: a 64x64 transformer on every step, all
                 # retained for BPTT -- the memory spike that OOMs when stage B opens.
+                # DetailRefiner also reads x0m (hfm-style full-res skip); the old
+                # DetailHead does not.
+                _is_ref = isinstance(detail_head, DetailRefiner)
                 if training and cfg.grad_checkpoint:
                     from torch.utils.checkpoint import checkpoint
-                    res = checkpoint(lambda ds, c: detail_head(ds, c, out_hw=(H, W)),
-                                     latent[:, nt:], xhat, use_reentrant=False)
+                    if _is_ref:
+                        res = checkpoint(lambda ds, c, x: detail_head(ds, c, x, out_hw=(H, W)),
+                                         latent[:, nt:], xhat, x0m, use_reentrant=False)
+                    else:
+                        res = checkpoint(lambda ds, c: detail_head(ds, c, out_hw=(H, W)),
+                                         latent[:, nt:], xhat, use_reentrant=False)
+                elif _is_ref:
+                    res = detail_head(latent[:, nt:], xhat, x0m, out_hw=(H, W))
                 else:
                     res = detail_head(latent[:, nt:], xhat, out_hw=(H, W))
                 xhat = xhat + res.float()

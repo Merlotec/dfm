@@ -7,7 +7,7 @@
     "n_mask_ch": 1,
     "d_model": 384,
     "n_slots": 128,
-    "n_detail_slots": 0,
+    "n_detail_slots": 16,
     "n_heads": 8,
     "mlp_ratio": 4.0,
     "ae_mlp": 4.0,
@@ -26,9 +26,9 @@
     "warp_hole_penalty": 0.0,
     "warp_head_layers": 2,
     "warp_detail_res": 64,
-    "warp_detail_range": 1.0,
+    "warp_detail_range": 0.2,
     "_detail_generative": "Stage-B closure is a conditional flow-matching sampler (warp.FlowMatchHead), not the deterministic DetailHead: the subgrid residual is stochastic, so L1 regression blurs/memorises. Trained with MSE on the flow velocity (see fm= in the step log); sampled with warp_flow_steps Euler steps at inference. Set false for the old deterministic head.",
-    "warp_detail_generative": true,
+    "warp_detail_generative": false,
     "warp_flow_steps": 8,
     "_detail_start": "Phase-2 closure warmup: the detail heads condition on the rolled-out resolved frame, so before evo is trained their target is evo error, not subgrid physics -- and it moves as evo learns. Wait, then switch on (both heads are zero-init, so activation is a no-op).",
     "detail_start_step": 20000,
@@ -79,8 +79,9 @@
     "warp_pyramid_unlock_steps": 6000,
     "warp_level_l2": 0.01,
     "warp_level_penalty_exp": 0.0,
-    "_detail_moved": "Detail generation moved to the DYNAMICS model (phase 2): the AE is now pure deterministic transport. n_detail_slots=0 => no detail head, no stage B. The dynamics owns the deterministic mean-detail head + the stochastic flow head (see RolloutTrainer / DetailGenerator).",
-    "_gain": "Measured on ae_step083000: the gain was doing MORE work than the warp -- ablating it cost +80% error vs +38% for the warp, |disp| sat at 2.6% of its bound while |g-1| SATURATED its own, and the multiplicative composite spanned 0.004..4.65 over an 8-step window. That is generation replacing transport. Fixes: range 0.5 -> 0.1 (8-step composite now ~0.43..2.14), gain_l1 0.01 -> 0.05 (at 0.01 the penalty was ~0.7% of recon, i.e. inert), and warp_gate_lambda_g 0 -> 1.0 so the complexity gate taxes gain deviation the same way it taxes displacement variance -- previously the gate policed the warp and left the gain completely unpoliced, which is likely WHY the model preferred gain."
+    "_detail_moved": "Deterministic (mean) detail is BACK in the AE, built like hfm: a coarse latent-driven part at warp_detail_res PLUS an hfm-style full-resolution refinement (3x3 skip conv on X_0 -> shallow post_conv, residual add). The skip is what carries sharpness in hfm; the old dfm head pooled its input and upsampled its output, so it could only ever be smooth. Leak-free: the skip reads X_0 (the decode operand), never the target. post_conv is a 5x5 receptive field, so it refines texture but cannot implement transport. The phase-2 DetailGenerator (mean+flow) still exists for the STOCHASTIC part.",
+    "_gain": "Measured on ae_step083000: the gain was doing MORE work than the warp -- ablating it cost +80% error vs +38% for the warp, |disp| sat at 2.6% of its bound while |g-1| SATURATED its own, and the multiplicative composite spanned 0.004..4.65 over an 8-step window. That is generation replacing transport. Fixes: range 0.5 -> 0.1 (8-step composite now ~0.43..2.14), gain_l1 0.01 -> 0.05 (at 0.01 the penalty was ~0.7% of recon, i.e. inert), and warp_gate_lambda_g 0 -> 1.0 so the complexity gate taxes gain deviation the same way it taxes displacement variance -- previously the gate policed the warp and left the gain completely unpoliced, which is likely WHY the model preferred gain.",
+    "skip_ch": 32
   },
   "training": {
     "batch_size": 32,

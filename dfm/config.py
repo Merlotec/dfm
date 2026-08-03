@@ -102,6 +102,11 @@ class DFMConfig:
     grad_checkpoint: bool = True   # recompute the per-step DetailHead in
                                    # backward (stage-B memory; see _seq_pass)
     warp_detail_range: float = 1.0
+    # hfm-style full-resolution skip for the deterministic closure: a 3x3 conv on X_0
+    # feeds a shallow post-conv that refines the convected frame at 256^2.  This is
+    # what carries sharpness in hfm (OverlappingPatchDecoder.post_conv); without it a
+    # head that emits at warp_detail_res and upsamples can only ever be smooth.
+    skip_ch: int = 32
     # Generative closure: the subgrid residual is stochastic (many fine-scale
     # realisations fit the same convected frame), so a deterministic L1 head
     # regresses to the blurry MEAN or memorises.  FlowMatchHead instead learns

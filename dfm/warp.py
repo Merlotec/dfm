@@ -491,7 +491,7 @@ class WarpDecoder(nn.Module):
         elif cfg.warp_detail_generative:
             self.detail_head = FlowMatchHead(cfg)
         else:
-            self.detail_head = DetailHead(cfg)
+            self.detail_head = DetailRefiner(cfg)
 
     def step(self, latent: torch.Tensor, D: torch.Tensor, G: torch.Tensor,
              x0m: torch.Tensor, use_detail: bool = True,
@@ -514,6 +514,8 @@ class WarpDecoder(nn.Module):
         if use_detail and self.detail_head is not None:
             if isinstance(self.detail_head, FlowMatchHead):
                 res = self.detail_head.sample(latent[:, nt:], xhat, out_hw=(H, W))
+            elif isinstance(self.detail_head, DetailRefiner):
+                res = self.detail_head(latent[:, nt:], xhat, x0m, out_hw=(H, W))
             else:
                 res = self.detail_head(latent[:, nt:], xhat, out_hw=(H, W))
             xhat = xhat + res.float()
@@ -576,6 +578,80 @@ class DetailHead(nn.Module):
         res = self.head(q).permute(0, 2, 1).reshape(B, -1, r, r)
         res = F.interpolate(res, size=(H, W), mode='bilinear', align_corners=False)
         return cfg.warp_detail_range * torch.tanh(res)
+
+
+class DetailRefiner(nn.Module):
+    """Deterministic (mean) closure, built the way hfm builds its decoder.
+
+    dfm's previous detail head was starved of detail by construction: it pooled the
+    convected frame to warp_detail_res, emitted at that resolution, and bilinearly
+    upsampled -- so everything it produced was smooth, and it never saw full-resolution
+    structure at all.  hfm does not do that.  Its OverlappingPatchDecoder ends with
+
+        return output + post_conv(cat([output, skip_feats], 1))
+
+    where skip_feats is a 3x3 conv on the INPUT frame at FULL resolution.  Fine
+    structure reaches the output through that skip path, bypassing the token
+    bottleneck entirely -- which is why hfm's detail survives.
+
+    Ported here in two parts:
+      coarse : detail slots -> r x r -> upsample.  The latent-driven, smooth part
+               (what the old head was, and all it was).
+      refine : a shallow full-res CNN over [convected frame ; skip(X_0)], added
+               residually.  This is where sharpness comes from.
+
+    Leak-free: the skip reads X_0, which is the decode OPERAND and is available at
+    inference -- never the target.  And it stays honest about transport: post_conv is
+    two 3x3 convs, a 5x5 receptive field, so it can refine local texture but cannot
+    implement a flow map.  Displacement must still come from the warp.
+    """
+
+    pos: torch.Tensor
+
+    def __init__(self, cfg: DFMConfig):
+        super().__init__()
+        self.cfg = cfg
+        r, d, C = cfg.warp_detail_res, cfg.d_model, cfg.in_channels
+        self.query = nn.Parameter(torch.zeros(1, 1, d))
+        self.register_buffer('pos', sincos_2d(r, r, d).unsqueeze(0), persistent=False)
+        self.cond_embed = nn.Conv2d(C, d, kernel_size=1)
+        self.layers = nn.ModuleList([
+            CrossAttnBlock(d, d, cfg.n_heads, cfg.ae_mlp, cfg.dropout)
+            for _ in range(cfg.warp_head_layers)
+        ])
+        self.head = nn.Linear(d, C)
+        # hfm-style: skip features off the SOURCE frame at full resolution
+        self.skip = nn.Sequential(
+            nn.Conv2d(C, cfg.skip_ch, 3, padding=1, padding_mode='replicate'), nn.GELU())
+        mid = max(C * 8, 64)
+        self.post_conv = nn.Sequential(
+            nn.Conv2d(C + cfg.skip_ch, mid, 3, padding=1, padding_mode='replicate'),
+            nn.GELU(),
+            nn.Conv2d(mid, C, 3, padding=1, padding_mode='replicate'))
+        nn.init.trunc_normal_(self.query, std=0.02)
+        # both output paths zero-init -> the refiner is an exact no-op at the
+        # stage-A -> stage-B boundary, as the old head was
+        nn.init.zeros_(self.head.weight); nn.init.zeros_(self.head.bias)
+        nn.init.zeros_(self.post_conv[-1].weight); nn.init.zeros_(self.post_conv[-1].bias)
+
+    def forward(self, detail_slots: torch.Tensor, cond: torch.Tensor,
+                x0m: torch.Tensor,
+                out_hw: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+        """-> residual to ADD to the convected frame `cond`."""
+        cfg = self.cfg
+        r = cfg.warp_detail_res
+        B = detail_slots.shape[0]
+        H, W = out_hw if out_hw is not None else cond.shape[-2:]
+        c = self.cond_embed(F.adaptive_avg_pool2d(cond, (r, r)))
+        q = self.query.expand(B, r * r, -1) + self.pos + c.flatten(2).transpose(1, 2)
+        for layer in self.layers:
+            q = layer(q, detail_slots)
+        coarse = self.head(q).permute(0, 2, 1).reshape(B, cfg.in_channels, r, r)
+        coarse = F.interpolate(coarse, size=(H, W), mode='bilinear', align_corners=False)
+        coarse = cfg.warp_detail_range * torch.tanh(coarse)
+        base = cond + coarse
+        # full-res refinement: this is the part that can be sharp
+        return coarse + self.post_conv(torch.cat([base, self.skip(x0m)], dim=1))
 
 
 def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
