@@ -101,7 +101,8 @@ def autonomous(ae, evo, frames, mask, use_detail, detail=None, stochastic=True):
          if (detail is not None and use_detail and stochastic) else None)
     for s in range(T - 1):
         L = evo(L, step_idx=s)
-        xhat, D, G = ae.decoder.step(L, D, G, x0m, use_detail=False)
+        # the frozen AE carries the deterministic closure now (see dynamics._rollout)
+        xhat, D, G = ae.decoder.step(L, D, G, x0m, use_detail=use_detail)
         if detail is not None and use_detail:
             xhat = detail.add(xhat, L, mask, noise=z, stochastic=stochastic)
             if z is not None:

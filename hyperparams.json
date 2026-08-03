@@ -81,7 +81,9 @@
     "warp_level_penalty_exp": 0.0,
     "_detail_moved": "Deterministic (mean) detail is BACK in the AE, built like hfm: a coarse latent-driven part at warp_detail_res PLUS an hfm-style full-resolution refinement (3x3 skip conv on X_0 -> shallow post_conv, residual add). The skip is what carries sharpness in hfm; the old dfm head pooled its input and upsampled its output, so it could only ever be smooth. Leak-free: the skip reads X_0 (the decode operand), never the target. post_conv is a 5x5 receptive field, so it refines texture but cannot implement transport. The phase-2 DetailGenerator (mean+flow) still exists for the STOCHASTIC part.",
     "_gain": "Measured on ae_step083000: the gain was doing MORE work than the warp -- ablating it cost +80% error vs +38% for the warp, |disp| sat at 2.6% of its bound while |g-1| SATURATED its own, and the multiplicative composite spanned 0.004..4.65 over an 8-step window. That is generation replacing transport. Fixes: range 0.5 -> 0.1 (8-step composite now ~0.43..2.14), gain_l1 0.01 -> 0.05 (at 0.01 the penalty was ~0.7% of recon, i.e. inert), and warp_gate_lambda_g 0 -> 1.0 so the complexity gate taxes gain deviation the same way it taxes displacement variance -- previously the gate policed the warp and left the gain completely unpoliced, which is likely WHY the model preferred gain.",
-    "skip_ch": 32
+    "skip_ch": 32,
+    "detail_mean_weight": 0.0,
+    "_detail_split": "Option (a): the AE owns the DETERMINISTIC detail (warp.DetailRefiner, applied via decoder.step(use_detail=True) in phase 2 and in autonomous inference), and phase 2 owns only the STOCHASTIC part (detail.FlowHead). detail_mean_weight=0 stands the phase-2 MeanHead down so the two are not fitting the same conditional mean. Set it back to 1.0 to have phase 2 correct the AE refiner under evo-induced distribution shift."
   },
   "training": {
     "batch_size": 32,

@@ -185,8 +185,14 @@ class RolloutTrainer:
         # map head's activations are retained -- and it runs sum(res_i^2) query tokens
         # (21504 at 3 pyramid levels) at d_model on EVERY rollout step.  That product
         # is what exhausts device memory in phase 2; recompute it in backward instead.
+        # use_detail=True: the frozen AE now carries the DETERMINISTIC closure
+        # (warp.DetailRefiner, hfm-style full-res skip), so the "resolved" frame here
+        # already includes it.  Phase 2 adds only the STOCHASTIC part on top.
+        # NOTE the refiner was trained teacher-forced (true convected frame) and is
+        # applied here to evo's PREDICTED frame -- a distribution shift, bounded by
+        # its 5x5 receptive field but worth watching in fd/tf.
         def _decode(L_, D_, G_, x0m_):
-            return self.ae.decoder.step(L_, D_, G_, x0m_, use_detail=False)
+            return self.ae.decoder.step(L_, D_, G_, x0m_, use_detail=True)
 
         use_ckpt = training and cfg.grad_checkpoint and torch.is_grad_enabled()
         # warm evo up first: see cfg.detail_start_step
@@ -200,7 +206,7 @@ class RolloutTrainer:
                 from torch.utils.checkpoint import checkpoint
                 xhat, D, G = checkpoint(_decode, L, D, G, x0m, use_reentrant=False)
             else:
-                xhat, D, G = self.ae.decoder.step(L, D, G, x0m, use_detail=False)
+                xhat, D, G = self.ae.decoder.step(L, D, G, x0m, use_detail=True)
             field_sum = field_sum + self.criterion(xhat, frames[:, s],
                                                    pixel_mask=pixel_mask)
             # Closure, conditioned on the rolled-out resolved frame + evo state.
